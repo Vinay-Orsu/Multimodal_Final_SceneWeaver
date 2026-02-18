@@ -1,0 +1,179 @@
+import argparse
+import json
+import sys
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+# Ensure project root is importable when running:
+# `python scripts/run_story_pipeline.py ...`
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from director_llm import SceneDirector, SceneDirectorConfig
+from memory_module import NarrativeMemory, VisionEmbedder, VisionEmbedderConfig
+from video_backbone import WanBackbone, WanBackboneConfig
+
+
+def ensure_dir(path: Path) -> None:
+    path.mkdir(parents=True, exist_ok=True)
+
+
+def export_jsonl(rows: List[Dict[str, Any]], out_path: Path) -> None:
+    with out_path.open("w", encoding="utf-8") as f:
+        for row in rows:
+            f.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+
+def maybe_init_embedder(
+    backend: str,
+    model_id: Optional[str],
+    device: str,
+) -> Optional[VisionEmbedder]:
+    if backend == "none":
+        return None
+    embedder = VisionEmbedder(
+        VisionEmbedderConfig(
+            backend=backend,
+            model_id=model_id,
+            device=device,
+        )
+    )
+    embedder.load()
+    return embedder
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Storyline -> Scene Director -> Wan clip windows with local/global memory feedback."
+    )
+    parser.add_argument("--storyline", type=str, required=True, help="Full storyline or plot text.")
+    parser.add_argument("--output_dir", type=str, default="outputs/story_run", help="Run output directory.")
+    parser.add_argument("--total_minutes", type=float, default=0.5, help="Target video length in minutes.")
+    parser.add_argument("--window_seconds", type=int, default=10, help="Seconds per clip window.")
+
+    parser.add_argument("--director_model_id", type=str, default="", help="Optional HF LLM id for director.")
+    parser.add_argument("--director_temperature", type=float, default=0.7, help="Director LLM temperature.")
+
+    parser.add_argument("--video_model_id", type=str, default="Wan-AI/Wan2.0-T2V-14B", help="Wan model id.")
+    parser.add_argument("--dtype", type=str, default="bfloat16", choices=["float16", "float32", "bfloat16"])
+    parser.add_argument("--device", type=str, default="auto", choices=["auto", "cuda", "mps", "cpu"])
+    parser.add_argument("--no_cpu_offload", action="store_true")
+    parser.add_argument("--num_frames", type=int, default=49)
+    parser.add_argument("--steps", type=int, default=30)
+    parser.add_argument("--guidance_scale", type=float, default=6.0)
+    parser.add_argument("--height", type=int, default=480)
+    parser.add_argument("--width", type=int, default=832)
+    parser.add_argument("--fps", type=int, default=8)
+    parser.add_argument("--seed", type=int, default=None)
+
+    parser.add_argument("--embedding_backend", type=str, default="clip", choices=["none", "clip", "dinov2"])
+    parser.add_argument("--embedding_model_id", type=str, default="", help="Optional embedder model id.")
+    parser.add_argument("--dry_run", action="store_true", help="Only plan/refine prompts. No video generation.")
+    args = parser.parse_args()
+
+    out_dir = Path(args.output_dir)
+    clips_dir = out_dir / "clips"
+    ensure_dir(out_dir)
+    ensure_dir(clips_dir)
+
+    director = SceneDirector(
+        SceneDirectorConfig(
+            model_id=args.director_model_id or None,
+            temperature=args.director_temperature,
+        ),
+        window_seconds=args.window_seconds,
+    )
+    director.load()
+    windows = director.plan_windows(storyline=args.storyline, total_minutes=args.total_minutes)
+
+    backbone = None
+    if not args.dry_run:
+        backbone = WanBackbone(
+            WanBackboneConfig(
+                model_id=args.video_model_id,
+                torch_dtype=args.dtype,
+                device=args.device,
+                enable_cpu_offload=not args.no_cpu_offload,
+            )
+        )
+        backbone.load()
+
+    embedder = None
+    memory = None
+    if args.embedding_backend != "none":
+        embedder = maybe_init_embedder(
+            backend=args.embedding_backend,
+            model_id=args.embedding_model_id or None,
+            device=args.device,
+        )
+        memory = NarrativeMemory()
+
+    previous_prompt = ""
+    memory_feedback = None
+    log_rows: List[Dict[str, Any]] = []
+
+    for window in windows:
+        refined_prompt = director.refine_prompt(
+            storyline=args.storyline,
+            window=window,
+            previous_prompt=previous_prompt,
+            memory_feedback=memory_feedback.to_dict() if memory_feedback else None,
+        )
+
+        clip_path = clips_dir / f"window_{window.index:03d}.mp4"
+        row: Dict[str, Any] = {
+            "window_index": window.index,
+            "time_range": [window.start_sec, window.end_sec],
+            "beat": window.beat,
+            "prompt_seed": window.prompt_seed,
+            "refined_prompt": refined_prompt,
+            "clip_path": clip_path.as_posix(),
+            "generated": False,
+            "memory_feedback": None,
+        }
+
+        if not args.dry_run:
+            frames = backbone.generate_clip(
+                prompt=refined_prompt,
+                num_frames=args.num_frames,
+                num_inference_steps=args.steps,
+                guidance_scale=args.guidance_scale,
+                height=args.height,
+                width=args.width,
+                seed=args.seed,
+            )
+            backbone.save_video(frames=frames, output_path=clip_path.as_posix(), fps=args.fps)
+            row["generated"] = True
+
+            if embedder is not None and memory is not None:
+                embedding = embedder.embed_frames(frames)
+                memory_feedback = memory.register_window(window.index, embedding)
+                row["memory_feedback"] = memory_feedback.to_dict()
+
+        previous_prompt = refined_prompt
+        log_rows.append(row)
+        print(f"[scene {window.index:03d}] {window.start_sec}-{window.end_sec}s ready")
+
+    export_jsonl(log_rows, out_dir / "run_log.jsonl")
+    summary = {
+        "storyline": args.storyline,
+        "total_minutes": args.total_minutes,
+        "window_seconds": args.window_seconds,
+        "num_windows": len(windows),
+        "dry_run": args.dry_run,
+        "director_model_id": args.director_model_id or None,
+        "video_model_id": None if args.dry_run else args.video_model_id,
+        "embedding_backend": args.embedding_backend,
+        "output_dir": out_dir.as_posix(),
+        "run_log": (out_dir / "run_log.jsonl").as_posix(),
+    }
+    with (out_dir / "run_summary.json").open("w", encoding="utf-8") as f:
+        json.dump(summary, f, ensure_ascii=False, indent=2)
+
+    print(f"[done] windows: {len(windows)}")
+    print(f"[done] logs: {(out_dir / 'run_log.jsonl').as_posix()}")
+
+
+if __name__ == "__main__":
+    main()

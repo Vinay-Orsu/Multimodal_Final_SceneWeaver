@@ -1,0 +1,36 @@
+---
+dataset_info:
+  features:
+  - name: video_id
+    dtype: string
+  - name: caption
+    dtype: string
+  - name: sen_id
+    dtype: int64
+  - name: category
+    dtype: int64
+  - name: url
+    dtype: string
+  - name: start time
+    dtype: float64
+  - name: end time
+    dtype: float64
+  - name: split
+    dtype: string
+  - name: id
+    dtype: int64
+  - name: __index_level_0__
+    dtype: int64
+  splits:
+  - name: train
+    num_bytes: 1102963
+    num_examples: 6513
+  - name: val
+    num_bytes: 85199
+    num_examples: 497
+  download_size: 598248
+  dataset_size: 1188162
+---
+# Dataset Card for "msr-vtt"
+
+[More Information needed](https://github.com/huggingface/datasets/blob/main/CONTRIBUTING.md#how-to-contribute-to-the-dataset-cards)

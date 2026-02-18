@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+.DS_Store
+.env
+
+# Local data artifacts
+data/raw/
+data/processed/
+outputs/runs/
+
+# Notebook checkpoints
+.ipynb_checkpoints/

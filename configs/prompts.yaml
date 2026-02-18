@@ -1,0 +1,8 @@
+system:
+  director_role: "You are a scene director for long-form video generation."
+  output_format: "Return concise cinematic prompt text."
+
+templates:
+  opening: "Establishing cinematic shot, clear subjects and environment. Story beat: {beat}"
+  continuation: "Continue naturally from prior clip with temporal continuity. Story beat: {beat}"
+  repair: "Repair drift while preserving story progression. Constraints: {constraints}. Beat: {beat}"

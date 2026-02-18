@@ -1,3 +1,27 @@
+Metadata-Version: 2.4
+Name: driftguard-video-pipeline
+Version: 0.1.0
+Summary: Basic drift-aware long-video generation pipeline scaffold.
+Author: SceneWeaver Team
+License: MIT
+Requires-Python: >=3.10
+Description-Content-Type: text/markdown
+License-File: LICENSE
+Requires-Dist: PyYAML>=6.0
+Requires-Dist: numpy>=1.24
+Provides-Extra: dev
+Requires-Dist: pytest>=8.0; extra == "dev"
+Requires-Dist: ruff>=0.6; extra == "dev"
+Provides-Extra: vision
+Requires-Dist: Pillow>=10.0; extra == "vision"
+Requires-Dist: transformers>=4.41; extra == "vision"
+Requires-Dist: torch>=2.1; extra == "vision"
+Provides-Extra: video
+Requires-Dist: imageio>=2.34; extra == "video"
+Requires-Dist: diffusers>=0.30; extra == "video"
+Requires-Dist: accelerate>=0.30; extra == "video"
+Dynamic: license-file
+
 # driftguard-video-pipeline
 
 Drift-aware architecture for long-form text-to-video generation with:

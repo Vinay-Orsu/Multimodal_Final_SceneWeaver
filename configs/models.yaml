@@ -1,0 +1,14 @@
+director:
+  model_id: ""
+  provider: "transformers"
+
+video:
+  backend: "wan"
+  model_id: "Wan-AI/Wan2.0-T2V-14B"
+  dtype: "bfloat16"
+  device: "auto"
+  cpu_offload: true
+
+embeddings:
+  clip_model_id: "openai/clip-vit-base-patch32"
+  dinov2_model_id: "facebook/dinov2-base"

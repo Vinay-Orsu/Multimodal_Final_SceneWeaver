@@ -1,0 +1,45 @@
+run:
+  name: "baseline"
+  output_root: "outputs/runs"
+
+story:
+  total_minutes: 0.5
+  window_seconds: 10
+  overlap_seconds: 2
+
+retrieval:
+  enabled: false
+  whitelist_domains: []
+  urls: []
+  chunk_size_chars: 600
+  chunk_overlap_chars: 120
+
+planning:
+  use_director_model: false
+  director_model_id: ""
+  director_temperature: 0.7
+
+generation:
+  enabled: false
+  dry_run: true
+  seed: 42
+  fps: 8
+  num_frames: 49
+  num_steps: 30
+  guidance_scale: 6.0
+  height: 480
+  width: 832
+  max_regens_per_window: 1
+
+memory:
+  enabled: false
+  embedding_backend: "clip"
+  embedding_model_id: ""
+  local_threshold: 0.25
+  global_threshold: 0.20
+
+critics:
+  drift_weight: 0.4
+  canon_weight: 0.3
+  prompt_weight: 0.3
+  acceptance_score: 0.55

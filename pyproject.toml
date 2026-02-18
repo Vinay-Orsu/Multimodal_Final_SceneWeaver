@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "driftguard-video-pipeline"
+version = "0.1.0"
+description = "Basic drift-aware long-video generation pipeline scaffold."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "SceneWeaver Team" }]
+dependencies = [
+  "PyYAML>=6.0",
+  "numpy>=1.24",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0", "ruff>=0.6"]
+vision = ["Pillow>=10.0", "transformers>=4.41", "torch>=2.1"]
+video = ["imageio>=2.34", "diffusers>=0.30", "accelerate>=0.30"]
+
+[project.scripts]
+driftguard = "driftguard.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]

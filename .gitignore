@@ -11,3 +11,4 @@ outputs/runs/
 
 # Notebook checkpoints
 .ipynb_checkpoints/
+models/

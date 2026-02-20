@@ -1,2 +1,8 @@
 PyYAML>=6.0
 numpy>=1.24
+Pillow>=10.0
+transformers>=4.41
+torch>=2.1
+imageio>=2.34
+diffusers>=0.30
+accelerate>=0.30

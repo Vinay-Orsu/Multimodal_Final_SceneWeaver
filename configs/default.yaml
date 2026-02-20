@@ -21,7 +21,9 @@ planning:
 
 generation:
   enabled: false
-  dry_run: true
+  dry_run: false
+  #model_id: "runwayml/stable-diffusion-v1-5"
+  #scheduler_id: "DPMPPMSampler"
   seed: 42
   fps: 8
   num_frames: 49

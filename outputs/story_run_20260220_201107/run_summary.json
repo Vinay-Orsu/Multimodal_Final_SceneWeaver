@@ -1,0 +1,12 @@
+{
+  "storyline": "A race starts between a rabbit and a tortoise, rabbit sprints early, then slows, tortoise steadily advances and wins.",
+  "total_minutes": 5.0,
+  "window_seconds": 10,
+  "num_windows": 30,
+  "dry_run": true,
+  "director_model_id": null,
+  "video_model_id": null,
+  "embedding_backend": "none",
+  "output_dir": "outputs/story_run_20260220_201107",
+  "run_log": "outputs/story_run_20260220_201107/run_log.jsonl"
+}

@@ -1,0 +1,12 @@
+{
+  "storyline": "sanity",
+  "total_minutes": 0.1,
+  "window_seconds": 10,
+  "num_windows": 1,
+  "dry_run": true,
+  "director_model_id": null,
+  "video_model_id": null,
+  "embedding_backend": "none",
+  "output_dir": "outputs/story_run_20260220_201019",
+  "run_log": "outputs/story_run_20260220_201019/run_log.jsonl"
+}

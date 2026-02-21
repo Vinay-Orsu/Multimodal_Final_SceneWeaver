@@ -3,8 +3,8 @@
 #SBATCH --output=slurm_logs/sceneweaver_%j.out
 #SBATCH --error=slurm_logs/sceneweaver_%j.err
 #SBATCH --time=3:00:00
-#SBATCH --partition=a100
-#SBATCH --gres=gpu:a100:1
+#SBATCH --partition=a40
+#SBATCH --gres=gpu:a40:1
 
 set -euo pipefail
 # Defaults are portable; override with env vars if needed.

@@ -39,11 +39,23 @@ class WanBackbone:
     def load(self) -> None:
         try:
             import torch
-            from diffusers import AutoPipelineForText2Video
         except ImportError as exc:
             raise ImportError(
-                "Missing dependencies. Install at least: torch, diffusers, transformers, accelerate."
+                "Missing/unsupported runtime dependencies for text-to-video. "
+                "Install or upgrade: torch, diffusers, transformers, accelerate. "
+                "Example: pip install -U 'diffusers>=0.30' transformers accelerate"
             ) from exc
+        try:
+            from diffusers import AutoPipelineForText2Video as PipelineClass
+        except ImportError:
+            try:
+                # Fallback for diffusers builds that do not expose AutoPipelineForText2Video.
+                from diffusers import DiffusionPipeline as PipelineClass
+            except ImportError as exc:
+                raise ImportError(
+                    "Could not import a usable diffusers pipeline class. "
+                    "Expected AutoPipelineForText2Video or DiffusionPipeline."
+                ) from exc
 
         cuda_available = torch.cuda.is_available()
         mps_available = hasattr(torch.backends, "mps") and torch.backends.mps.is_available()
@@ -76,7 +88,7 @@ class WanBackbone:
             )
 
         torch_dtype = self._get_torch_dtype(torch)
-        pipe = AutoPipelineForText2Video.from_pretrained(
+        pipe = PipelineClass.from_pretrained(
             self.config.model_id,
             torch_dtype=torch_dtype,
             trust_remote_code=True,

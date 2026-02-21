@@ -7,13 +7,15 @@
 #SBATCH --gres=gpu:a100:1
 
 set -euo pipefail
-
 # Defaults are portable; override with env vars if needed.
 PROJECT_ROOT="${PROJECT_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
 ENV_PATH="${ENV_PATH:-}"
+VENV_PATH="${VENV_PATH:-}"
 WAN_LOCAL_MODEL="${WAN_LOCAL_MODEL:-}"
 CONDA_SH="${CONDA_SH:-/apps/python/3.12-conda/etc/profile.d/conda.sh}"
 USE_MODULES="${USE_MODULES:-1}"
+PYTHON_MODULE="${PYTHON_MODULE:-python/3.12-conda}"
+CUDA_MODULE="${CUDA_MODULE:-cuda/12.4.1}"
 USE_OFFLINE_MODE="${USE_OFFLINE_MODE:-0}"
 DEVICE="${DEVICE:-cuda}"
 PYTHON_BIN="${PYTHON_BIN:-}"
@@ -25,15 +27,22 @@ MODEL_INCLUDE="${MODEL_INCLUDE:-*.safetensors *.json *.txt tokenizer* *.model}"
 
 # Optional HPC module setup (kept off by default for local/pool PCs).
 if [ "${USE_MODULES}" = "1" ] && command -v module >/dev/null 2>&1; then
-  module purge
-  module load python/3.12-conda
-  module load cuda/12.4.1
+  if ! module purge; then
+    echo "Warning: module purge failed; continuing."
+  fi
+  if [ -n "${PYTHON_MODULE}" ] && ! module load "${PYTHON_MODULE}"; then
+    echo "Warning: could not load Python module '${PYTHON_MODULE}'."
+  fi
+  if [ -n "${CUDA_MODULE}" ] && ! module load "${CUDA_MODULE}"; then
+    echo "Warning: could not load CUDA module '${CUDA_MODULE}'; continuing without module load."
+    echo "Set CUDA_MODULE to a valid module name, or set USE_MODULES=0 to skip modules."
+  fi
 fi
 
 mkdir -p "${PROJECT_ROOT}/slurm_logs" "${PROJECT_ROOT}/outputs" "${PROJECT_ROOT}/.hf"
 cd "${PROJECT_ROOT}"
 
-# Optional conda activation.
+# Optional runtime activation.
 if [ -n "${ENV_PATH}" ]; then
   if [ -f "${CONDA_SH}" ]; then
     # shellcheck disable=SC1090
@@ -44,6 +53,13 @@ if [ -n "${ENV_PATH}" ]; then
     exit 1
   fi
   conda activate "${ENV_PATH}"
+elif [ -n "${VENV_PATH}" ]; then
+  if [ ! -f "${VENV_PATH}/bin/activate" ]; then
+    echo "Virtualenv activate script not found at ${VENV_PATH}/bin/activate"
+    exit 1
+  fi
+  # shellcheck disable=SC1090
+  source "${VENV_PATH}/bin/activate"
 fi
 
 export PYTHONUNBUFFERED=1
@@ -61,7 +77,14 @@ fi
 STORYLINE="${STORYLINE:-A race starts between a rabbit and a tortoise, rabbit sprints early, then slows, tortoise steadily advances and wins.}"
 TOTAL_MINUTES="${TOTAL_MINUTES:-5}"
 WINDOW_SECONDS="${WINDOW_SECONDS:-10}"
-VIDEO_MODEL_ID="${VIDEO_MODEL_ID:-${WAN_LOCAL_MODEL:-Wan-AI/Wan2.0-T2V-14B}}"
+if [ -n "${WAN_LOCAL_MODEL}" ]; then
+  DEFAULT_VIDEO_MODEL_ID="${WAN_LOCAL_MODEL}"
+elif [ -d "${MODEL_DIR}" ]; then
+  DEFAULT_VIDEO_MODEL_ID="${MODEL_DIR}"
+else
+  DEFAULT_VIDEO_MODEL_ID="${MODEL_REPO}"
+fi
+VIDEO_MODEL_ID="${VIDEO_MODEL_ID:-${DEFAULT_VIDEO_MODEL_ID}}"
 EMBEDDING_BACKEND="${EMBEDDING_BACKEND:-none}"
 DRY_RUN="${DRY_RUN:-0}"
 AUTO_FALLBACK_DRY_RUN="${AUTO_FALLBACK_DRY_RUN:-1}"
@@ -105,13 +128,20 @@ fi
 
 # Preflight for real generation runtime on local/pool machines.
 if [ "${DRY_RUN}" = "0" ]; then
-  if ! "${PYTHON_BIN}" -c "import diffusers" >/dev/null 2>&1; then
+  if [ "${DEVICE}" = "cuda" ] && ! "${PYTHON_BIN}" -c "import torch; assert torch.cuda.is_available()" >/dev/null 2>&1; then
+    echo "DEVICE=cuda requested, but CUDA is not available in this session."
+    echo "Run this via Slurm on a GPU node (e.g., sbatch run_story_pipeline.sh), or set DEVICE=cpu for dry/testing."
+    exit 1
+  fi
+  if ! "${PYTHON_BIN}" -c "import diffusers; assert hasattr(diffusers, 'AutoPipelineForText2Video') or hasattr(diffusers, 'DiffusionPipeline')" >/dev/null 2>&1; then
     if [ "${AUTO_FALLBACK_DRY_RUN}" = "1" ]; then
-      echo "Real generation runtime is not healthy on this machine (diffusers import failed)."
+      echo "Real generation runtime is not healthy on this machine (diffusers text2video pipeline unavailable)."
       echo "Falling back to DRY_RUN=1. Set AUTO_FALLBACK_DRY_RUN=0 to disable this behavior."
+      echo "Suggested fix in env: pip install -U 'diffusers>=0.30' transformers accelerate"
       DRY_RUN="1"
     else
-      echo "Real generation runtime is not healthy on this machine (diffusers import failed)."
+      echo "Real generation runtime is not healthy on this machine (diffusers text2video pipeline unavailable)."
+      echo "Suggested fix in env: pip install -U 'diffusers>=0.30' transformers accelerate"
       echo "Use DRY_RUN=1, or run on a CUDA node where diffusers/torch stack is stable."
       exit 1
     fi

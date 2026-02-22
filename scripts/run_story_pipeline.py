@@ -43,6 +43,33 @@ def maybe_init_embedder(
     return embedder
 
 
+def build_generation_prompt(
+    refined_prompt: str,
+    beat: str,
+    style_prefix: str,
+    character_lock: str,
+) -> str:
+    parts = []
+    if style_prefix.strip():
+        parts.append(style_prefix.strip())
+    if character_lock.strip():
+        parts.append(f"Character continuity: {character_lock.strip()}")
+    parts.append(f"Current beat: {beat.strip()}")
+    parts.append(f"Shot prompt: {refined_prompt.strip()}")
+    parts.append(
+        "Strictly follow the current beat and keep the same characters, identities, and scene context. "
+        "No unrelated objects, no random scene changes."
+    )
+    return " ".join(parts)
+
+
+def _compact_previous_prompt(prompt: str) -> str:
+    if not prompt:
+        return ""
+    head = prompt.split(" Previous visual context:")[0].strip()
+    return head[:240]
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Storyline -> Scene Director -> Wan clip windows with local/global memory feedback."
@@ -66,6 +93,30 @@ def main() -> None:
     parser.add_argument("--width", type=int, default=832)
     parser.add_argument("--fps", type=int, default=8)
     parser.add_argument("--seed", type=int, default=None)
+    parser.add_argument(
+        "--style_prefix",
+        type=str,
+        default="cinematic realistic, coherent motion, stable camera, high detail",
+        help="Global style and quality prefix prepended to each generation prompt.",
+    )
+    parser.add_argument(
+        "--character_lock",
+        type=str,
+        default=(
+            "one rabbit and one tortoise only; keep same appearance, size, and colors across all windows; "
+            "no extra animals or humans"
+        ),
+        help="Continuity constraints to keep subject identity stable across windows.",
+    )
+    parser.add_argument(
+        "--negative_prompt",
+        type=str,
+        default=(
+            "blurry, low quality, flicker, frame jitter, deformed anatomy, duplicate subjects, extra limbs, "
+            "extra animals, wrong species, text, subtitles, watermark, logo, collage, split-screen, glitch"
+        ),
+        help="Negative prompt passed into the video generator.",
+    )
 
     parser.add_argument("--embedding_backend", type=str, default="clip", choices=["none", "clip", "dinov2"])
     parser.add_argument("--embedding_model_id", type=str, default="", help="Optional embedder model id.")
@@ -120,6 +171,12 @@ def main() -> None:
             previous_prompt=previous_prompt,
             memory_feedback=memory_feedback.to_dict() if memory_feedback else None,
         )
+        generation_prompt = build_generation_prompt(
+            refined_prompt=refined_prompt,
+            beat=window.beat,
+            style_prefix=args.style_prefix,
+            character_lock=args.character_lock,
+        )
 
         clip_path = clips_dir / f"window_{window.index:03d}.mp4"
         row: Dict[str, Any] = {
@@ -128,6 +185,8 @@ def main() -> None:
             "beat": window.beat,
             "prompt_seed": window.prompt_seed,
             "refined_prompt": refined_prompt,
+            "generation_prompt": generation_prompt,
+            "negative_prompt": args.negative_prompt,
             "clip_path": clip_path.as_posix(),
             "generated": False,
             "memory_feedback": None,
@@ -135,7 +194,8 @@ def main() -> None:
 
         if not args.dry_run:
             frames = backbone.generate_clip(
-                prompt=refined_prompt,
+                prompt=generation_prompt,
+                negative_prompt=args.negative_prompt,
                 num_frames=args.num_frames,
                 num_inference_steps=args.steps,
                 guidance_scale=args.guidance_scale,
@@ -151,7 +211,7 @@ def main() -> None:
                 memory_feedback = memory.register_window(window.index, embedding)
                 row["memory_feedback"] = memory_feedback.to_dict()
 
-        previous_prompt = refined_prompt
+        previous_prompt = _compact_previous_prompt(refined_prompt)
         log_rows.append(row)
         print(f"[scene {window.index:03d}] {window.start_sec}-{window.end_sec}s ready")
 

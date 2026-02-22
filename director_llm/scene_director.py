@@ -107,8 +107,25 @@ class SceneDirector:
 
     @staticmethod
     def _extract_story_beats(storyline: str) -> List[str]:
-        raw = re.split(r"[.\n;]+", storyline)
-        beats = [b.strip() for b in raw if b.strip()]
+        text = storyline.strip()
+        if not text:
+            return []
+
+        # Prefer sentence/semicolon boundaries first.
+        beats = [b.strip() for b in re.split(r"[.\n;:]+", text) if b.strip()]
+
+        # If user provided one long comma-delimited line, split that into beats.
+        if len(beats) <= 1 and "," in text:
+            beats = [b.strip() for b in re.split(r",\s*", text) if b.strip()]
+
+        # If still a single block, break gentle temporal connectors into beats.
+        if len(beats) <= 1:
+            beats = [
+                b.strip()
+                for b in re.split(r"\b(?:then|after that|next|finally|eventually)\b", text, flags=re.IGNORECASE)
+                if b.strip()
+            ]
+
         return beats
 
     @staticmethod
@@ -131,7 +148,11 @@ class SceneDirector:
             note = memory_feedback.get("suggested_constraints")
             if isinstance(note, str) and note.strip():
                 continuity = note.strip()
-        previous_context = f" Previous visual context: {previous_prompt}" if previous_prompt else ""
+        previous_context = ""
+        if previous_prompt:
+            compact_prev = previous_prompt.split(" Previous visual context:")[0].strip()
+            compact_prev = compact_prev[:240]
+            previous_context = f" Previous visual context: {compact_prev}"
         return (
             f"{window.prompt_seed}. Time window {window.start_sec}-{window.end_sec}s, "
             f"{continuity}.{previous_context}"

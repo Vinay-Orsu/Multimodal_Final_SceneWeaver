@@ -88,11 +88,18 @@ class WanBackbone:
             )
 
         torch_dtype = self._get_torch_dtype(torch)
-        pipe = PipelineClass.from_pretrained(
-            self.config.model_id,
-            torch_dtype=torch_dtype,
-            trust_remote_code=True,
-        )
+        # Some pipeline classes (e.g., WanPipeline) don't accept trust_remote_code.
+        try:
+            pipe = PipelineClass.from_pretrained(
+                self.config.model_id,
+                torch_dtype=torch_dtype,
+            )
+        except TypeError:
+            pipe = PipelineClass.from_pretrained(
+                self.config.model_id,
+                torch_dtype=torch_dtype,
+                trust_remote_code=True,
+            )
 
         use_cpu_offload = self.config.enable_cpu_offload and resolved_device == "cuda"
         if use_cpu_offload:
@@ -149,7 +156,67 @@ class WanBackbone:
 
         try:
             import imageio.v3 as iio
+            import numpy as np
         except ImportError as exc:
             raise ImportError("imageio is required to save MP4/GIF outputs.") from exc
 
-        iio.imwrite(out.as_posix(), frames, fps=fps)
+        normalized = []
+        for frame in frames:
+            arr = np.asarray(frame)
+
+            # Some pipelines return a whole clip per item: (T, H, W, C) or (T, C, H, W).
+            if arr.ndim == 4:
+                if arr.shape[-1] in (1, 2, 3, 4):
+                    frame_batch = [arr[i] for i in range(arr.shape[0])]
+                elif arr.shape[1] in (1, 2, 3, 4):
+                    frame_batch = [np.transpose(arr[i], (1, 2, 0)) for i in range(arr.shape[0])]
+                else:
+                    raise ValueError(
+                        f"Unsupported clip shape {arr.shape}. Expected TxHxWxC or TxCxHxW with C in 1..4."
+                    )
+            else:
+                frame_batch = [arr]
+
+            for f in frame_batch:
+                # Convert CHW -> HWC when needed.
+                if f.ndim == 3 and f.shape[0] in (1, 2, 3, 4) and f.shape[-1] not in (1, 2, 3, 4):
+                    f = np.transpose(f, (1, 2, 0))
+
+                if f.ndim == 2:
+                    pass
+                elif f.ndim == 3 and f.shape[-1] in (1, 2, 3, 4):
+                    pass
+                else:
+                    raise ValueError(
+                        f"Unsupported frame shape {f.shape}. Expected HxW, HxWxC, or CxHxW with C in 1..4."
+                    )
+
+                if f.dtype.kind in ("f", "c"):
+                    f_min = float(np.min(f))
+                    f_max = float(np.max(f))
+
+                    # Common model output ranges:
+                    # 1) [0, 1] -> scale directly
+                    # 2) [-1, 1] -> shift+scale
+                    # 3) already [0, 255] float -> clip/cast
+                    if 0.0 <= f_min and f_max <= 1.0:
+                        f = (f * 255.0).round().astype(np.uint8)
+                    elif -1.1 <= f_min and f_max <= 1.1:
+                        f = (((f + 1.0) / 2.0) * 255.0).round().astype(np.uint8)
+                    else:
+                        # Unknown float range: normalize dynamically to avoid near-black outputs.
+                        if f_max > f_min:
+                            f = ((f - f_min) / (f_max - f_min) * 255.0).round().astype(np.uint8)
+                        else:
+                            f = np.zeros_like(f, dtype=np.uint8)
+                elif f.dtype != np.uint8:
+                    f = np.clip(f, 0, 255).astype(np.uint8)
+
+                normalized.append(f)
+
+        try:
+            video = np.stack(normalized, axis=0)
+        except ValueError as exc:
+            raise ValueError("Frames have inconsistent shapes and cannot be encoded into a video.") from exc
+
+        iio.imwrite(out.as_posix(), video, fps=fps)

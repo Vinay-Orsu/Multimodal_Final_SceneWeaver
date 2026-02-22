@@ -7,8 +7,12 @@
 #SBATCH --gres=gpu:a40:1
 
 set -euo pipefail
+# Some cluster profile scripts assume this exists; keep nounset-safe default.
+export LD_LIBRARY_PATH="${LD_LIBRARY_PATH:-}"
 # Defaults are portable; override with env vars if needed.
-PROJECT_ROOT="${PROJECT_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
+# Under Slurm, prefer the original submit directory instead of spool staging.
+DEFAULT_PROJECT_ROOT="${SLURM_SUBMIT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
+PROJECT_ROOT="${PROJECT_ROOT:-${DEFAULT_PROJECT_ROOT}}"
 ENV_PATH="${ENV_PATH:-}"
 VENV_PATH="${VENV_PATH:-}"
 WAN_LOCAL_MODEL="${WAN_LOCAL_MODEL:-}"
@@ -20,7 +24,7 @@ USE_OFFLINE_MODE="${USE_OFFLINE_MODE:-0}"
 DEVICE="${DEVICE:-cuda}"
 PYTHON_BIN="${PYTHON_BIN:-}"
 DOWNLOAD_MODEL="${DOWNLOAD_MODEL:-0}"
-MODEL_REPO="${MODEL_REPO:-Wan-AI/Wan2.2-TI2V-5B}"
+MODEL_REPO="${MODEL_REPO:-Wan-AI/Wan2.1-T2V-1.3B-Diffusers}"
 MODEL_DIR="${MODEL_DIR:-${PROJECT_ROOT}/models/$(basename "${MODEL_REPO}")}"
 # Keep this narrow to avoid full snapshot downloads.
 MODEL_INCLUDE="${MODEL_INCLUDE:-*.safetensors *.json *.txt tokenizer* *.model}"
@@ -63,6 +67,8 @@ elif [ -n "${VENV_PATH}" ]; then
 fi
 
 export PYTHONUNBUFFERED=1
+# Prevent ~/.local packages from shadowing the conda env on cluster nodes.
+export PYTHONNOUSERSITE=1
 export HF_HOME="${HF_HOME:-${PROJECT_ROOT}/.hf}"
 
 # Online mode is default for pool PCs; enable offline only if local model/cache exists.
@@ -88,6 +94,9 @@ VIDEO_MODEL_ID="${VIDEO_MODEL_ID:-${DEFAULT_VIDEO_MODEL_ID}}"
 EMBEDDING_BACKEND="${EMBEDDING_BACKEND:-none}"
 DRY_RUN="${DRY_RUN:-0}"
 AUTO_FALLBACK_DRY_RUN="${AUTO_FALLBACK_DRY_RUN:-1}"
+STYLE_PREFIX="${STYLE_PREFIX:-cinematic realistic, coherent motion, stable camera, high detail}"
+CHARACTER_LOCK="${CHARACTER_LOCK:-one rabbit and one tortoise only; keep same appearance, size, and colors across all windows; no extra animals or humans}"
+NEGATIVE_PROMPT="${NEGATIVE_PROMPT:-blurry, low quality, flicker, frame jitter, deformed anatomy, duplicate subjects, extra limbs, extra animals, wrong species, text, subtitles, watermark, logo, collage, split-screen, glitch}"
 RUN_STAMP="$(date +%Y%m%d_%H%M%S)"
 OUTPUT_DIR="${OUTPUT_DIR:-outputs/story_run_${RUN_STAMP}}"
 
@@ -154,6 +163,9 @@ CMD=("${PYTHON_BIN}" scripts/run_story_pipeline.py
   --window_seconds "${WINDOW_SECONDS}" \
   --video_model_id "${VIDEO_MODEL_ID}" \
   --embedding_backend "${EMBEDDING_BACKEND}" \
+  --style_prefix "${STYLE_PREFIX}" \
+  --character_lock "${CHARACTER_LOCK}" \
+  --negative_prompt "${NEGATIVE_PROMPT}" \
   --device "${DEVICE}" \
   --output_dir "${OUTPUT_DIR}")
 
@@ -170,5 +182,8 @@ echo "PYTHON_BIN=${PYTHON_BIN}"
 echo "DOWNLOAD_MODEL=${DOWNLOAD_MODEL}"
 echo "MODEL_REPO=${MODEL_REPO}"
 echo "MODEL_DIR=${MODEL_DIR}"
+echo "STYLE_PREFIX=${STYLE_PREFIX}"
+echo "CHARACTER_LOCK=${CHARACTER_LOCK}"
+echo "NEGATIVE_PROMPT=${NEGATIVE_PROMPT}"
 
 "${CMD[@]}"

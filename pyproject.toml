@@ -20,9 +20,6 @@ dev = ["pytest>=8.0", "ruff>=0.6"]
 vision = ["Pillow>=10.0", "transformers>=4.41", "torch>=2.1"]
 video = ["imageio>=2.34", "diffusers>=0.30", "accelerate>=0.30"]
 
-[project.scripts]
-driftguard = "driftguard.cli:main"
-
 [tool.setuptools]
 package-dir = {"" = "src"}
 

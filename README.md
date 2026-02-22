@@ -1,46 +1,30 @@
-# driftguard-video-pipeline
+# SceneWeaver Story Pipeline
 
-Drift-aware architecture for long-form text-to-video generation with:
-- retrieval + canon building
-- storyline planning + per-window prompting
-- windowed generation
-- critics (drift/canon/prompt)
-- iterative refine loop
-
-## Structure
-```text
-src/driftguard/
-  cli.py
-  pipeline.py
-  retrieval/{fetch,clean,chunk,index}.py
-  planning/{canon,storyboard,prompts}.py
-  generation/{video,windowing,seeds}.py
-  critics/{drift,canon,prompt}.py
-  refine/{loop,budget}.py
-  utils/{io,logging,types}.py
-```
+Active and supported runtime is the story pipeline script stack:
+- `run_story_pipeline.sh`
+- `scripts/run_story_pipeline.py`
+- `director_llm/scene_director.py`
+- `video_backbone/wan_backbone.py`
+- `memory_module/embedding_memory.py`
 
 ## Install
 ```bash
 pip install -r requirements.txt
-pip install -e .
 ```
 
-## Quick Start (Basic Working Pipeline)
-Use the committed storyline sample:
+## Quick Start (Cluster)
 ```bash
-driftguard run --config configs/default.yaml --storyline_file data/examples/storyline.txt --dry_run
+sbatch --partition=a40 --gres=gpu:a40:1 \
+  --export=ALL,ENV_PATH=sceneweaver311,HF_HOME=$PWD/.hf,DRY_RUN=0,AUTO_FALLBACK_DRY_RUN=0 \
+  run_story_pipeline.sh
 ```
 
-This writes:
-- `outputs/runs/<run_id>/run_log.jsonl`
-- `outputs/runs/<run_id>/run_summary.json`
+## Architecture (Active Path)
+1. Storyline is split into time windows by `SceneDirector`.
+2. Each window prompt is refined with continuity context.
+3. `WanBackbone` (or another diffusers T2V model id) generates frames.
+4. Frames are encoded to per-window MP4 clips.
+5. Optional memory embeddings (`clip` or `dinov2`) provide continuity feedback.
 
-## Legacy Components Kept
-Existing components are still available and adapted as backends:
-- `director_llm/scene_director.py`
-- `memory_module/embedding_memory.py`
-- `video_backbone/wan_backbone.py`
-
-## Cluster Note
-For real video generation with Wan 2.0 14B, run on CUDA cluster nodes and set model/runtime parameters in `configs/models.yaml` or CLI flags.
+## Note on `src/driftguard`
+`src/driftguard` is retained only as archived experimental code and is not a supported runtime path for current jobs.

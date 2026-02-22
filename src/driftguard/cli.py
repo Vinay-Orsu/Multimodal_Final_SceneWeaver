@@ -22,6 +22,11 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: List[str] | None = None) -> None:
+    raise SystemExit(
+        "The driftguard CLI path is deprecated for this repository. "
+        "Use `run_story_pipeline.sh` or `python scripts/run_story_pipeline.py ...`."
+    )
+
     parser = build_parser()
     args = parser.parse_args(argv)
 

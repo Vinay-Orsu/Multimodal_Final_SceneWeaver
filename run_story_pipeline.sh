@@ -91,12 +91,21 @@ else
   DEFAULT_VIDEO_MODEL_ID="${MODEL_REPO}"
 fi
 VIDEO_MODEL_ID="${VIDEO_MODEL_ID:-${DEFAULT_VIDEO_MODEL_ID}}"
+DIRECTOR_MODEL_ID="${DIRECTOR_MODEL_ID:-}"
+DIRECTOR_TEMPERATURE="${DIRECTOR_TEMPERATURE:-0.3}"
 EMBEDDING_BACKEND="${EMBEDDING_BACKEND:-none}"
 DRY_RUN="${DRY_RUN:-0}"
 AUTO_FALLBACK_DRY_RUN="${AUTO_FALLBACK_DRY_RUN:-1}"
 STYLE_PREFIX="${STYLE_PREFIX:-cinematic realistic, coherent motion, stable camera, high detail}"
 CHARACTER_LOCK="${CHARACTER_LOCK:-one rabbit and one tortoise only; keep same appearance, size, and colors across all windows; no extra animals or humans}"
 NEGATIVE_PROMPT="${NEGATIVE_PROMPT:-blurry, low quality, flicker, frame jitter, deformed anatomy, duplicate subjects, extra limbs, extra animals, wrong species, text, subtitles, watermark, logo, collage, split-screen, glitch}"
+NUM_FRAMES="${NUM_FRAMES:-49}"
+STEPS="${STEPS:-35}"
+GUIDANCE_SCALE="${GUIDANCE_SCALE:-8.5}"
+HEIGHT="${HEIGHT:-480}"
+WIDTH="${WIDTH:-832}"
+FPS="${FPS:-8}"
+SEED="${SEED:-42}"
 RUN_STAMP="$(date +%Y%m%d_%H%M%S)"
 OUTPUT_DIR="${OUTPUT_DIR:-outputs/story_run_${RUN_STAMP}}"
 
@@ -157,17 +166,40 @@ if [ "${DRY_RUN}" = "0" ]; then
   fi
 fi
 
+SCRIPT_HELP="$("${PYTHON_BIN}" scripts/run_story_pipeline.py --help 2>/dev/null || true)"
+supports_flag() {
+  echo "${SCRIPT_HELP}" | grep -q -- "$1"
+}
+
 CMD=("${PYTHON_BIN}" scripts/run_story_pipeline.py
   --storyline "${STORYLINE}" \
   --total_minutes "${TOTAL_MINUTES}" \
   --window_seconds "${WINDOW_SECONDS}" \
   --video_model_id "${VIDEO_MODEL_ID}" \
+  --director_temperature "${DIRECTOR_TEMPERATURE}" \
   --embedding_backend "${EMBEDDING_BACKEND}" \
-  --style_prefix "${STYLE_PREFIX}" \
-  --character_lock "${CHARACTER_LOCK}" \
-  --negative_prompt "${NEGATIVE_PROMPT}" \
+  --num_frames "${NUM_FRAMES}" \
+  --steps "${STEPS}" \
+  --guidance_scale "${GUIDANCE_SCALE}" \
+  --height "${HEIGHT}" \
+  --width "${WIDTH}" \
+  --fps "${FPS}" \
+  --seed "${SEED}" \
   --device "${DEVICE}" \
   --output_dir "${OUTPUT_DIR}")
+
+if supports_flag "--style_prefix"; then
+  CMD+=(--style_prefix "${STYLE_PREFIX}")
+fi
+if supports_flag "--character_lock"; then
+  CMD+=(--character_lock "${CHARACTER_LOCK}")
+fi
+if supports_flag "--negative_prompt"; then
+  CMD+=(--negative_prompt "${NEGATIVE_PROMPT}")
+fi
+if [ -n "${DIRECTOR_MODEL_ID}" ]; then
+  CMD+=(--director_model_id "${DIRECTOR_MODEL_ID}")
+fi
 
 if [ "${DRY_RUN}" = "1" ]; then
   CMD+=(--dry_run)
@@ -178,6 +210,8 @@ echo "OUTPUT_DIR=${OUTPUT_DIR}"
 echo "DEVICE=${DEVICE}"
 echo "DRY_RUN=${DRY_RUN}"
 echo "VIDEO_MODEL_ID=${VIDEO_MODEL_ID}"
+echo "DIRECTOR_MODEL_ID=${DIRECTOR_MODEL_ID}"
+echo "DIRECTOR_TEMPERATURE=${DIRECTOR_TEMPERATURE}"
 echo "PYTHON_BIN=${PYTHON_BIN}"
 echo "DOWNLOAD_MODEL=${DOWNLOAD_MODEL}"
 echo "MODEL_REPO=${MODEL_REPO}"
@@ -185,5 +219,12 @@ echo "MODEL_DIR=${MODEL_DIR}"
 echo "STYLE_PREFIX=${STYLE_PREFIX}"
 echo "CHARACTER_LOCK=${CHARACTER_LOCK}"
 echo "NEGATIVE_PROMPT=${NEGATIVE_PROMPT}"
+echo "NUM_FRAMES=${NUM_FRAMES}"
+echo "STEPS=${STEPS}"
+echo "GUIDANCE_SCALE=${GUIDANCE_SCALE}"
+echo "HEIGHT=${HEIGHT}"
+echo "WIDTH=${WIDTH}"
+echo "FPS=${FPS}"
+echo "SEED=${SEED}"
 
 "${CMD[@]}"

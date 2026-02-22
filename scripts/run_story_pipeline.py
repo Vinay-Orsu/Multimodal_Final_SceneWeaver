@@ -193,6 +193,7 @@ def main() -> None:
         }
 
         if not args.dry_run:
+            window_seed = None if args.seed is None else args.seed + window.index
             frames = backbone.generate_clip(
                 prompt=generation_prompt,
                 negative_prompt=args.negative_prompt,
@@ -201,10 +202,11 @@ def main() -> None:
                 guidance_scale=args.guidance_scale,
                 height=args.height,
                 width=args.width,
-                seed=args.seed,
+                seed=window_seed,
             )
             backbone.save_video(frames=frames, output_path=clip_path.as_posix(), fps=args.fps)
             row["generated"] = True
+            row["seed"] = window_seed
 
             if embedder is not None and memory is not None:
                 embedding = embedder.embed_frames(frames)

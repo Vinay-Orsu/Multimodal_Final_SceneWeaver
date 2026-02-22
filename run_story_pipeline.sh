@@ -5,8 +5,12 @@
 #SBATCH --time=3:00:00
 #SBATCH --partition=a40
 #SBATCH --gres=gpu:a40:1
-
 set -euo pipefail
+
+
+module purge
+module load python
+cd /home/hpc/v123be/v123be36/Multimodal_Final_SceneWeaver/
 # Some cluster profile scripts assume this exists; keep nounset-safe default.
 export LD_LIBRARY_PATH="${LD_LIBRARY_PATH:-}"
 # Defaults are portable; override with env vars if needed.
@@ -15,13 +19,15 @@ DEFAULT_PROJECT_ROOT="${SLURM_SUBMIT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" 
 PROJECT_ROOT="${PROJECT_ROOT:-${DEFAULT_PROJECT_ROOT}}"
 ENV_PATH="${ENV_PATH:-}"
 VENV_PATH="${VENV_PATH:-}"
-WAN_LOCAL_MODEL="${WAN_LOCAL_MODEL:-}"
+DEFAULT_ENV_PATH="${DEFAULT_ENV_PATH:-sceneweaver_runtime}"
+WAN_LOCAL_MODEL="${WAN_LOCAL_MODEL:-/home/vault/v123be/v123be36/Wan2.1-T2V-1.3B-Diffusers}"
 CONDA_SH="${CONDA_SH:-/apps/python/3.12-conda/etc/profile.d/conda.sh}"
 USE_MODULES="${USE_MODULES:-1}"
 PYTHON_MODULE="${PYTHON_MODULE:-python/3.12-conda}"
 CUDA_MODULE="${CUDA_MODULE:-cuda/12.4.1}"
-USE_OFFLINE_MODE="${USE_OFFLINE_MODE:-0}"
-DEVICE="${DEVICE:-cuda}"
+USE_OFFLINE_MODE="${USE_OFFLINE_MODE:-1}"
+DEVICE="${DEVICE:-auto}"
+STRICT_DEVICE="${STRICT_DEVICE:-0}"
 PYTHON_BIN="${PYTHON_BIN:-}"
 DOWNLOAD_MODEL="${DOWNLOAD_MODEL:-0}"
 MODEL_REPO="${MODEL_REPO:-Wan-AI/Wan2.1-T2V-1.3B-Diffusers}"
@@ -45,6 +51,11 @@ fi
 
 mkdir -p "${PROJECT_ROOT}/slurm_logs" "${PROJECT_ROOT}/outputs" "${PROJECT_ROOT}/.hf"
 cd "${PROJECT_ROOT}"
+
+# Optional default env when neither ENV_PATH nor VENV_PATH is provided.
+if [ -z "${ENV_PATH}" ] && [ -z "${VENV_PATH}" ] && [ -n "${DEFAULT_ENV_PATH}" ]; then
+  ENV_PATH="${DEFAULT_ENV_PATH}"
+fi
 
 # Optional runtime activation.
 if [ -n "${ENV_PATH}" ]; then
@@ -94,20 +105,40 @@ VIDEO_MODEL_ID="${VIDEO_MODEL_ID:-${DEFAULT_VIDEO_MODEL_ID}}"
 DIRECTOR_MODEL_ID="${DIRECTOR_MODEL_ID:-}"
 DIRECTOR_TEMPERATURE="${DIRECTOR_TEMPERATURE:-0.3}"
 EMBEDDING_BACKEND="${EMBEDDING_BACKEND:-none}"
-DRY_RUN="${DRY_RUN:-0}"
-AUTO_FALLBACK_DRY_RUN="${AUTO_FALLBACK_DRY_RUN:-1}"
+DRY_RUN="0"
+AUTO_FALLBACK_DRY_RUN="${AUTO_FALLBACK_DRY_RUN:-0}"
 STYLE_PREFIX="${STYLE_PREFIX:-cinematic realistic, coherent motion, stable camera, high detail}"
 CHARACTER_LOCK="${CHARACTER_LOCK:-one rabbit and one tortoise only; keep same appearance, size, and colors across all windows; no extra animals or humans}"
 NEGATIVE_PROMPT="${NEGATIVE_PROMPT:-blurry, low quality, flicker, frame jitter, deformed anatomy, duplicate subjects, extra limbs, extra animals, wrong species, text, subtitles, watermark, logo, collage, split-screen, glitch}"
 NUM_FRAMES="${NUM_FRAMES:-49}"
 STEPS="${STEPS:-35}"
-GUIDANCE_SCALE="${GUIDANCE_SCALE:-8.5}"
+GUIDANCE_SCALE="${GUIDANCE_SCALE:-6.0}"
 HEIGHT="${HEIGHT:-480}"
 WIDTH="${WIDTH:-832}"
 FPS="${FPS:-8}"
 SEED="${SEED:-42}"
 RUN_STAMP="$(date +%Y%m%d_%H%M%S)"
 OUTPUT_DIR="${OUTPUT_DIR:-outputs/story_run_${RUN_STAMP}}"
+
+# If a local model directory is provided, ensure it looks like a diffusers pipeline.
+if [ -d "${VIDEO_MODEL_ID}" ] && [ ! -f "${VIDEO_MODEL_ID}/model_index.json" ]; then
+  echo "Local VIDEO_MODEL_ID is not a diffusers pipeline directory: ${VIDEO_MODEL_ID}"
+  echo "Missing required file: ${VIDEO_MODEL_ID}/model_index.json"
+  if [ -f "${VIDEO_MODEL_ID}/config.json" ] && grep -q '"_class_name"[[:space:]]*:[[:space:]]*"WanModel"' "${VIDEO_MODEL_ID}/config.json"; then
+    echo "Detected native Wan checkpoint layout (WanModel config)."
+    echo "Current SceneWeaver runtime expects diffusers pipeline format for --video_model_id."
+  fi
+  echo "Set VIDEO_MODEL_ID to a diffusers-formatted local model directory."
+  exit 1
+fi
+
+# Current runtime is text-only. Reject TI2V checkpoints to avoid low-quality/noise outputs.
+if echo "${VIDEO_MODEL_ID}" | grep -qi "TI2V"; then
+  echo "VIDEO_MODEL_ID appears to be a TI2V model: ${VIDEO_MODEL_ID}"
+  echo "This pipeline currently provides text-only prompts and no image conditioning input."
+  echo "Use a T2V model (e.g., Wan2.1-T2V-1.3B-Diffusers) for stable scene generation."
+  exit 1
+fi
 
 if [ -z "${PYTHON_BIN}" ]; then
   if command -v python >/dev/null 2>&1; then
@@ -147,22 +178,22 @@ fi
 # Preflight for real generation runtime on local/pool machines.
 if [ "${DRY_RUN}" = "0" ]; then
   if [ "${DEVICE}" = "cuda" ] && ! "${PYTHON_BIN}" -c "import torch; assert torch.cuda.is_available()" >/dev/null 2>&1; then
-    echo "DEVICE=cuda requested, but CUDA is not available in this session."
-    echo "Run this via Slurm on a GPU node (e.g., sbatch run_story_pipeline.sh), or set DEVICE=cpu for dry/testing."
-    exit 1
-  fi
-  if ! "${PYTHON_BIN}" -c "import diffusers; assert hasattr(diffusers, 'AutoPipelineForText2Video') or hasattr(diffusers, 'DiffusionPipeline')" >/dev/null 2>&1; then
-    if [ "${AUTO_FALLBACK_DRY_RUN}" = "1" ]; then
-      echo "Real generation runtime is not healthy on this machine (diffusers text2video pipeline unavailable)."
-      echo "Falling back to DRY_RUN=1. Set AUTO_FALLBACK_DRY_RUN=0 to disable this behavior."
-      echo "Suggested fix in env: pip install -U 'diffusers>=0.30' transformers accelerate"
-      DRY_RUN="1"
-    else
-      echo "Real generation runtime is not healthy on this machine (diffusers text2video pipeline unavailable)."
-      echo "Suggested fix in env: pip install -U 'diffusers>=0.30' transformers accelerate"
-      echo "Use DRY_RUN=1, or run on a CUDA node where diffusers/torch stack is stable."
+    echo "DEVICE=cuda requested, but torch.cuda.is_available() is false in this environment."
+    if ! "${PYTHON_BIN}" -c "import torch; print('torch_version=' + str(torch.__version__)); print('torch_cuda_build=' + str(torch.version.cuda)); print('cuda_available=' + str(torch.cuda.is_available())); print('cuda_device_count=' + str(torch.cuda.device_count()))" 2>/dev/null; then
+      echo "Torch diagnostics unavailable (torch import failed in the active environment)."
+    fi
+    echo "Likely cause: CPU-only torch build in the active env, or a CUDA/runtime mismatch."
+    if [ "${STRICT_DEVICE}" = "1" ]; then
+      echo "STRICT_DEVICE=1 set; exiting."
       exit 1
     fi
+    echo "Falling back to DEVICE=auto."
+    DEVICE="auto"
+  fi
+  if ! "${PYTHON_BIN}" -c "import diffusers; assert hasattr(diffusers, 'AutoPipelineForText2Video') or hasattr(diffusers, 'DiffusionPipeline')" >/dev/null 2>&1; then
+    echo "Real generation runtime is not healthy on this machine (diffusers text2video pipeline unavailable)."
+    echo "Suggested fix in env: pip install -U 'diffusers>=0.30' transformers accelerate"
+    exit 1
   fi
 fi
 
@@ -199,10 +230,6 @@ if supports_flag "--negative_prompt"; then
 fi
 if [ -n "${DIRECTOR_MODEL_ID}" ]; then
   CMD+=(--director_model_id "${DIRECTOR_MODEL_ID}")
-fi
-
-if [ "${DRY_RUN}" = "1" ]; then
-  CMD+=(--dry_run)
 fi
 
 echo "PROJECT_ROOT=${PROJECT_ROOT}"

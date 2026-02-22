@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import platform
 from dataclasses import dataclass
 from pathlib import Path
@@ -23,6 +24,27 @@ class WanBackbone:
         self.config = config
         self.pipeline: Optional[Any] = None
 
+    @staticmethod
+    def _fix_text_encoder_embedding_tie(pipe: Any) -> None:
+        """
+        Some runtime stacks can leave UMT5 encoder token embeddings randomly initialized
+        (shared.weight loaded, encoder.embed_tokens.weight missing). Force-tie them.
+        """
+        text_encoder = getattr(pipe, "text_encoder", None)
+        if text_encoder is None:
+            return
+
+        shared = getattr(text_encoder, "shared", None)
+        encoder = getattr(text_encoder, "encoder", None)
+        embed_tokens = getattr(encoder, "embed_tokens", None) if encoder is not None else None
+        if shared is None or embed_tokens is None:
+            return
+        if not hasattr(shared, "weight") or not hasattr(embed_tokens, "weight"):
+            return
+
+        if shared.weight.data_ptr() != embed_tokens.weight.data_ptr():
+            embed_tokens.weight = shared.weight
+
     def _get_torch_dtype(self, torch_module: Any):
         dtype_name = self.config.torch_dtype.lower()
         if dtype_name == "float16":
@@ -37,6 +59,28 @@ class WanBackbone:
         )
 
     def load(self) -> None:
+        model_path = Path(self.config.model_id)
+        if model_path.is_dir():
+            model_index = model_path / "model_index.json"
+            if not model_index.exists():
+                hint = ""
+                config_path = model_path / "config.json"
+                if config_path.exists():
+                    try:
+                        with config_path.open("r", encoding="utf-8") as f:
+                            config = json.load(f)
+                        if config.get("_class_name") == "WanModel":
+                            hint = (
+                                " Detected native Wan checkpoint layout "
+                                "(config _class_name='WanModel')."
+                            )
+                    except Exception:
+                        pass
+                raise RuntimeError(
+                    f"Local model directory is missing model_index.json: {model_index}.{hint} "
+                    "This runtime expects a diffusers pipeline directory for --video_model_id."
+                )
+
         try:
             import torch
         except ImportError as exc:
@@ -100,6 +144,8 @@ class WanBackbone:
                 torch_dtype=torch_dtype,
                 trust_remote_code=True,
             )
+
+        self._fix_text_encoder_embedding_tie(pipe)
 
         use_cpu_offload = self.config.enable_cpu_offload and resolved_device == "cuda"
         if use_cpu_offload:

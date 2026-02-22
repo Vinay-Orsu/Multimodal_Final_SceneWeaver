@@ -3,12 +3,13 @@ __pycache__/
 .pytest_cache/
 .DS_Store
 .env
-
+.hf
+slurm_logs/
 # Local data artifacts
 data/raw/
 data/processed/
 outputs/runs/
-
+outputs/*
 # Notebook checkpoints
 .ipynb_checkpoints/
 models/

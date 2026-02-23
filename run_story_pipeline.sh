@@ -34,6 +34,7 @@ MODEL_REPO="${MODEL_REPO:-Wan-AI/Wan2.1-T2V-1.3B-Diffusers}"
 MODEL_DIR="${MODEL_DIR:-${PROJECT_ROOT}/models/$(basename "${MODEL_REPO}")}"
 # Keep this narrow to avoid full snapshot downloads.
 MODEL_INCLUDE="${MODEL_INCLUDE:-*.safetensors *.json *.txt tokenizer* *.model}"
+DINOV2_LOCAL_MODEL="${DINOV2_LOCAL_MODEL:-/home/vault/v123be/v123be36/facebook/dinov2-base}"
 
 # Optional HPC module setup (kept off by default for local/pool PCs).
 if [ "${USE_MODULES}" = "1" ] && command -v module >/dev/null 2>&1; then
@@ -104,7 +105,10 @@ fi
 VIDEO_MODEL_ID="${VIDEO_MODEL_ID:-${DEFAULT_VIDEO_MODEL_ID}}"
 DIRECTOR_MODEL_ID="${DIRECTOR_MODEL_ID:-}"
 DIRECTOR_TEMPERATURE="${DIRECTOR_TEMPERATURE:-0.3}"
-EMBEDDING_BACKEND="${EMBEDDING_BACKEND:-none}"
+EMBEDDING_BACKEND="${EMBEDDING_BACKEND:-dinov2}"
+EMBEDDING_MODEL_ID="${EMBEDDING_MODEL_ID:-}"
+LAST_FRAME_MEMORY="${LAST_FRAME_MEMORY:-1}"
+CONTINUITY_CANDIDATES="${CONTINUITY_CANDIDATES:-2}"
 DRY_RUN="0"
 AUTO_FALLBACK_DRY_RUN="${AUTO_FALLBACK_DRY_RUN:-0}"
 STYLE_PREFIX="${STYLE_PREFIX:-cinematic realistic, coherent motion, stable camera, high detail}"
@@ -119,6 +123,18 @@ FPS="${FPS:-8}"
 SEED="${SEED:-42}"
 RUN_STAMP="$(date +%Y%m%d_%H%M%S)"
 OUTPUT_DIR="${OUTPUT_DIR:-outputs/story_run_${RUN_STAMP}}"
+
+if [ "${EMBEDDING_BACKEND}" = "dinov2" ] && [ -z "${EMBEDDING_MODEL_ID}" ]; then
+  EMBEDDING_MODEL_ID="${DINOV2_LOCAL_MODEL}"
+fi
+
+if [ "${USE_OFFLINE_MODE}" = "1" ] && [ "${EMBEDDING_BACKEND}" = "dinov2" ]; then
+  if [ ! -f "${EMBEDDING_MODEL_ID}/preprocessor_config.json" ]; then
+    echo "Offline dinov2 embedding requires a local path with preprocessor_config.json."
+    echo "Current EMBEDDING_MODEL_ID='${EMBEDDING_MODEL_ID}' is not a valid local dinov2 directory."
+    exit 1
+  fi
+fi
 
 # If a local model directory is provided, ensure it looks like a diffusers pipeline.
 if [ -d "${VIDEO_MODEL_ID}" ] && [ ! -f "${VIDEO_MODEL_ID}/model_index.json" ]; then
@@ -228,6 +244,15 @@ fi
 if supports_flag "--negative_prompt"; then
   CMD+=(--negative_prompt "${NEGATIVE_PROMPT}")
 fi
+if supports_flag "--embedding_model_id" && [ -n "${EMBEDDING_MODEL_ID}" ]; then
+  CMD+=(--embedding_model_id "${EMBEDDING_MODEL_ID}")
+fi
+if supports_flag "--continuity_candidates"; then
+  CMD+=(--continuity_candidates "${CONTINUITY_CANDIDATES}")
+fi
+if supports_flag "--last_frame_memory" && [ "${LAST_FRAME_MEMORY}" = "1" ]; then
+  CMD+=(--last_frame_memory)
+fi
 if [ -n "${DIRECTOR_MODEL_ID}" ]; then
   CMD+=(--director_model_id "${DIRECTOR_MODEL_ID}")
 fi
@@ -246,6 +271,10 @@ echo "MODEL_DIR=${MODEL_DIR}"
 echo "STYLE_PREFIX=${STYLE_PREFIX}"
 echo "CHARACTER_LOCK=${CHARACTER_LOCK}"
 echo "NEGATIVE_PROMPT=${NEGATIVE_PROMPT}"
+echo "EMBEDDING_BACKEND=${EMBEDDING_BACKEND}"
+echo "EMBEDDING_MODEL_ID=${EMBEDDING_MODEL_ID}"
+echo "LAST_FRAME_MEMORY=${LAST_FRAME_MEMORY}"
+echo "CONTINUITY_CANDIDATES=${CONTINUITY_CANDIDATES}"
 echo "NUM_FRAMES=${NUM_FRAMES}"
 echo "STEPS=${STEPS}"
 echo "GUIDANCE_SCALE=${GUIDANCE_SCALE}"

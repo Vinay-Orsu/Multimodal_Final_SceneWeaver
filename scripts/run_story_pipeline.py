@@ -70,6 +70,17 @@ def _compact_previous_prompt(prompt: str) -> str:
     return head[:240]
 
 
+def _cosine_similarity(v1: Optional[Any], v2: Optional[Any]) -> Optional[float]:
+    if v1 is None or v2 is None:
+        return None
+    import numpy as np
+
+    arr1 = np.asarray(v1)
+    arr2 = np.asarray(v2)
+    denom = (np.linalg.norm(arr1) * np.linalg.norm(arr2)) + 1e-12
+    return float(np.dot(arr1, arr2) / denom)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Storyline -> Scene Director -> Wan clip windows with local/global memory feedback."
@@ -120,6 +131,17 @@ def main() -> None:
 
     parser.add_argument("--embedding_backend", type=str, default="clip", choices=["none", "clip", "dinov2"])
     parser.add_argument("--embedding_model_id", type=str, default="", help="Optional embedder model id.")
+    parser.add_argument(
+        "--last_frame_memory",
+        action="store_true",
+        help="Use previous clip last-frame embedding to rank candidate next clips by first-frame continuity.",
+    )
+    parser.add_argument(
+        "--continuity_candidates",
+        type=int,
+        default=1,
+        help="Candidate clips per window when last-frame memory is available (higher is slower).",
+    )
     parser.add_argument("--dry_run", action="store_true", help="Only plan/refine prompts. No video generation.")
     args = parser.parse_args()
 
@@ -162,6 +184,7 @@ def main() -> None:
 
     previous_prompt = ""
     memory_feedback = None
+    previous_last_frame_embedding = None
     log_rows: List[Dict[str, Any]] = []
 
     for window in windows:
@@ -193,25 +216,78 @@ def main() -> None:
         }
 
         if not args.dry_run:
-            window_seed = None if args.seed is None else args.seed + window.index
-            frames = backbone.generate_clip(
-                prompt=generation_prompt,
-                negative_prompt=args.negative_prompt,
-                num_frames=args.num_frames,
-                num_inference_steps=args.steps,
-                guidance_scale=args.guidance_scale,
-                height=args.height,
-                width=args.width,
-                seed=window_seed,
+            base_seed = None if args.seed is None else args.seed + window.index
+            continuity_active = (
+                embedder is not None
+                and args.last_frame_memory
+                and previous_last_frame_embedding is not None
+                and args.continuity_candidates > 1
             )
+            num_candidates = args.continuity_candidates if continuity_active else 1
+            candidate_rows: List[Dict[str, Any]] = []
+            best_frames = None
+            best_seed = base_seed
+            best_transition_similarity = None
+
+            for candidate_idx in range(num_candidates):
+                candidate_seed = None
+                if base_seed is not None:
+                    candidate_seed = base_seed + (candidate_idx * 100000)
+                candidate_frames = backbone.generate_clip(
+                    prompt=generation_prompt,
+                    negative_prompt=args.negative_prompt,
+                    num_frames=args.num_frames,
+                    num_inference_steps=args.steps,
+                    guidance_scale=args.guidance_scale,
+                    height=args.height,
+                    width=args.width,
+                    seed=candidate_seed,
+                )
+
+                transition_similarity = None
+                if embedder is not None and args.last_frame_memory and previous_last_frame_embedding is not None:
+                    candidate_first_embedding = embedder.embed_first_frame(candidate_frames)
+                    transition_similarity = _cosine_similarity(candidate_first_embedding, previous_last_frame_embedding)
+
+                candidate_rows.append(
+                    {
+                        "candidate_index": candidate_idx,
+                        "seed": candidate_seed,
+                        "transition_similarity": transition_similarity,
+                    }
+                )
+
+                if best_frames is None:
+                    best_frames = candidate_frames
+                    best_seed = candidate_seed
+                    best_transition_similarity = transition_similarity
+                elif transition_similarity is not None and (
+                    best_transition_similarity is None or transition_similarity > best_transition_similarity
+                ):
+                    best_frames = candidate_frames
+                    best_seed = candidate_seed
+                    best_transition_similarity = transition_similarity
+
+            frames = best_frames
+            window_seed = best_seed
             backbone.save_video(frames=frames, output_path=clip_path.as_posix(), fps=args.fps)
             row["generated"] = True
             row["seed"] = window_seed
+            row["continuity_candidates"] = num_candidates
+            row["selected_transition_similarity"] = best_transition_similarity
+            if len(candidate_rows) > 1:
+                row["candidate_scores"] = candidate_rows
 
             if embedder is not None and memory is not None:
                 embedding = embedder.embed_frames(frames)
-                memory_feedback = memory.register_window(window.index, embedding)
+                memory_feedback = memory.register_window(
+                    window.index,
+                    embedding,
+                    transition_similarity=best_transition_similarity,
+                )
                 row["memory_feedback"] = memory_feedback.to_dict()
+                if args.last_frame_memory:
+                    previous_last_frame_embedding = embedder.embed_last_frame(frames)
 
         previous_prompt = _compact_previous_prompt(refined_prompt)
         log_rows.append(row)
@@ -227,6 +303,8 @@ def main() -> None:
         "director_model_id": args.director_model_id or None,
         "video_model_id": None if args.dry_run else args.video_model_id,
         "embedding_backend": args.embedding_backend,
+        "last_frame_memory": args.last_frame_memory,
+        "continuity_candidates": args.continuity_candidates,
         "output_dir": out_dir.as_posix(),
         "run_log": (out_dir / "run_log.jsonl").as_posix(),
     }

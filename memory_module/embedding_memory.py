@@ -16,6 +16,7 @@ class MemoryFeedback:
     window_index: int
     local_similarity: Optional[float]
     global_similarity: Optional[float]
+    transition_similarity: Optional[float]
     drift_detected: bool
     suggested_constraints: str
 
@@ -24,6 +25,7 @@ class MemoryFeedback:
             "window_index": self.window_index,
             "local_similarity": self.local_similarity,
             "global_similarity": self.global_similarity,
+            "transition_similarity": self.transition_similarity,
             "drift_detected": self.drift_detected,
             "suggested_constraints": self.suggested_constraints,
         }
@@ -76,14 +78,49 @@ class VisionEmbedder:
         raise ValueError("Unsupported backend. Use 'clip' or 'dinov2'.")
 
     def embed_frames(self, frames: List[Any], sample_count: int = 4):
+        flattened_frames = self._prepare_flattened_frames(frames)
+        sampled = self._sample_frames(flattened_frames, sample_count=sample_count)
+        pil_frames = [self._to_pil_image(f) for f in sampled]
+        embeds = self._encode_pil_frames(pil_frames)
+        clip_embedding = embeds.mean(dim=0)
+        clip_embedding = clip_embedding / (clip_embedding.norm() + 1e-12)
+        return clip_embedding.detach().cpu().numpy()
+
+    def embed_frame(self, frame: Any):
         if self.model is None or self.processor is None or self.torch is None:
             raise RuntimeError("VisionEmbedder not loaded. Call load() first.")
-        if not frames:
+        pil_frame = self._to_pil_image(frame)
+        embeds = self._encode_pil_frames([pil_frame])
+        frame_embedding = embeds[0]
+        frame_embedding = frame_embedding / (frame_embedding.norm() + 1e-12)
+        return frame_embedding.detach().cpu().numpy()
+
+    def embed_first_frame(self, frames: List[Any]):
+        flattened_frames = self._prepare_flattened_frames(frames)
+        return self.embed_frame(flattened_frames[0])
+
+    def embed_last_frame(self, frames: List[Any]):
+        flattened_frames = self._prepare_flattened_frames(frames)
+        return self.embed_frame(flattened_frames[-1])
+
+    def _prepare_flattened_frames(self, frames: List[Any]) -> List[Any]:
+        if self.model is None or self.processor is None or self.torch is None:
+            raise RuntimeError("VisionEmbedder not loaded. Call load() first.")
+        if frames is None:
+            raise ValueError("frames is empty.")
+        try:
+            frame_count = len(frames)
+        except TypeError:
+            raise TypeError("frames must be a sequence or array-like object.")
+        if frame_count == 0:
             raise ValueError("frames is empty.")
 
-        sampled = self._sample_frames(frames, sample_count=sample_count)
-        pil_frames = [self._to_pil_image(f) for f in sampled]
+        flattened_frames = self._flatten_frame_sequence(frames)
+        if len(flattened_frames) == 0:
+            raise ValueError("frames is empty after flattening.")
+        return flattened_frames
 
+    def _encode_pil_frames(self, pil_frames: List[Any]):
         backend = self.config.backend.lower()
         if backend == "clip":
             inputs = self.processor(images=pil_frames, return_tensors="pt")
@@ -96,10 +133,7 @@ class VisionEmbedder:
             with self.torch.no_grad():
                 out = self.model(**inputs)
             embeds = out.last_hidden_state.mean(dim=1)
-
-        clip_embedding = embeds.mean(dim=0)
-        clip_embedding = clip_embedding / (clip_embedding.norm() + 1e-12)
-        return clip_embedding.detach().cpu().numpy()
+        return embeds
 
     @staticmethod
     def _sample_frames(frames: List[Any], sample_count: int) -> List[Any]:
@@ -110,6 +144,29 @@ class VisionEmbedder:
         return sampled
 
     @staticmethod
+    def _flatten_frame_sequence(frames: Any) -> List[Any]:
+        import numpy as np
+
+        flattened: List[Any] = []
+        for item in list(frames):
+            arr = np.asarray(item)
+
+            # Common batched clip layouts from video pipelines.
+            if arr.ndim == 5 and arr.shape[0] == 1:
+                arr = arr[0]
+            if arr.ndim == 4:
+                if arr.shape[-1] in (1, 2, 3, 4):
+                    flattened.extend([arr[i] for i in range(arr.shape[0])])
+                    continue
+                if arr.shape[1] in (1, 2, 3, 4):
+                    flattened.extend([np.transpose(arr[i], (1, 2, 0)) for i in range(arr.shape[0])])
+                    continue
+
+            flattened.append(item)
+
+        return flattened
+
+    @staticmethod
     def _to_pil_image(frame: Any):
         from PIL import Image
         import numpy as np
@@ -117,9 +174,35 @@ class VisionEmbedder:
         if isinstance(frame, Image.Image):
             return frame.convert("RGB")
         if isinstance(frame, np.ndarray):
-            if frame.dtype != np.uint8:
-                frame = frame.clip(0, 255).astype(np.uint8)
-            return Image.fromarray(frame).convert("RGB")
+            arr = frame
+            while arr.ndim > 3 and arr.shape[0] == 1:
+                arr = arr[0]
+
+            if arr.ndim == 3 and arr.shape[0] in (1, 2, 3, 4) and arr.shape[-1] not in (1, 2, 3, 4):
+                arr = np.transpose(arr, (1, 2, 0))
+
+            if arr.ndim == 2:
+                pass
+            elif arr.ndim == 3 and arr.shape[-1] in (1, 2, 3, 4):
+                pass
+            else:
+                raise TypeError(f"Unsupported frame shape for embedding extraction: {arr.shape}")
+
+            if arr.dtype.kind in ("f", "c"):
+                arr_min = float(np.min(arr))
+                arr_max = float(np.max(arr))
+                if 0.0 <= arr_min and arr_max <= 1.0:
+                    arr = (arr * 255.0).round().astype(np.uint8)
+                elif -1.1 <= arr_min and arr_max <= 1.1:
+                    arr = (((arr + 1.0) / 2.0) * 255.0).round().astype(np.uint8)
+                elif arr_max > arr_min:
+                    arr = ((arr - arr_min) / (arr_max - arr_min) * 255.0).round().astype(np.uint8)
+                else:
+                    arr = np.zeros_like(arr, dtype=np.uint8)
+            elif arr.dtype != np.uint8:
+                arr = np.clip(arr, 0, 255).astype(np.uint8)
+
+            return Image.fromarray(arr).convert("RGB")
         raise TypeError("Frame type not supported for embedding extraction.")
 
     def _resolve_device(self, torch_module: Any) -> str:
@@ -144,7 +227,12 @@ class NarrativeMemory:
         self.global_embedding = None
         self.window_count = 0
 
-    def register_window(self, window_index: int, embedding) -> MemoryFeedback:
+    def register_window(
+        self,
+        window_index: int,
+        embedding,
+        transition_similarity: Optional[float] = None,
+    ) -> MemoryFeedback:
         import numpy as np
 
         local_sim = self._cosine_similarity(embedding, self.local_embedding)
@@ -158,6 +246,9 @@ class NarrativeMemory:
         if global_sim is not None and global_sim < self.global_threshold:
             drift_detected = True
             notes.append("Reconnect with core storyline entities, setting, and mood from earlier windows.")
+        if transition_similarity is not None and transition_similarity < 0.70:
+            drift_detected = True
+            notes.append("Match next clip opening frame to the previous final frame composition and subject pose.")
         if not notes:
             notes.append("Maintain style and continuity while advancing the next story beat.")
 
@@ -175,6 +266,7 @@ class NarrativeMemory:
             window_index=window_index,
             local_similarity=local_sim,
             global_similarity=global_sim,
+            transition_similarity=transition_similarity,
             drift_detected=drift_detected,
             suggested_constraints=" ".join(notes),
         )

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 
@@ -8,6 +9,7 @@ from typing import Any, Dict, List, Optional
 class VisionEmbedderConfig:
     backend: str = "clip"  # clip | dinov2
     model_id: Optional[str] = None
+    adapter_ckpt: Optional[str] = None
     device: str = "auto"
 
 
@@ -40,6 +42,7 @@ class VisionEmbedder:
         self.config = config
         self.processor = None
         self.model = None
+        self.projector = None
         self.torch = None
         self._resolved_device = "cpu"
 
@@ -66,6 +69,7 @@ class VisionEmbedder:
             self.processor = CLIPProcessor.from_pretrained(model_id)
             self.model = CLIPModel.from_pretrained(model_id).to(self._resolved_device)
             self.model.eval()
+            self._load_adapter_if_available(torch)
             return
 
         if backend == "dinov2":
@@ -73,6 +77,7 @@ class VisionEmbedder:
             self.processor = AutoImageProcessor.from_pretrained(model_id)
             self.model = AutoModel.from_pretrained(model_id).to(self._resolved_device)
             self.model.eval()
+            self._load_adapter_if_available(torch)
             return
 
         raise ValueError("Unsupported backend. Use 'clip' or 'dinov2'.")
@@ -133,7 +138,71 @@ class VisionEmbedder:
             with self.torch.no_grad():
                 out = self.model(**inputs)
             embeds = out.last_hidden_state.mean(dim=1)
+        if self.projector is not None:
+            with self.torch.no_grad():
+                embeds = self.projector(embeds)
         return embeds
+
+    def _load_adapter_if_available(self, torch_module: Any) -> None:
+        if not self.config.adapter_ckpt:
+            return
+        ckpt_path = Path(self.config.adapter_ckpt)
+        if not ckpt_path.is_file():
+            raise FileNotFoundError(f"Embedding adapter checkpoint not found: {ckpt_path}")
+
+        checkpoint = torch_module.load(ckpt_path.as_posix(), map_location="cpu")
+        state_dict = checkpoint.get("projector_state_dict")
+        if not isinstance(state_dict, dict) or len(state_dict) == 0:
+            raise ValueError(
+                f"Invalid adapter checkpoint {ckpt_path}: missing non-empty 'projector_state_dict'."
+            )
+
+        linear_weights = [
+            (name, tensor)
+            for name, tensor in state_dict.items()
+            if name.endswith(".weight") and hasattr(tensor, "ndim") and tensor.ndim == 2
+        ]
+        if len(linear_weights) < 2:
+            raise ValueError(
+                f"Invalid adapter checkpoint {ckpt_path}: expected at least two linear layers."
+            )
+
+        first_linear = linear_weights[0][1]
+        last_linear = linear_weights[-1][1]
+        hidden_dim = int(first_linear.shape[0])
+        input_dim = int(first_linear.shape[1])
+        output_dim = int(last_linear.shape[0])
+
+        has_dropout = "net.3.weight" in state_dict
+        if has_dropout:
+            projector = torch_module.nn.Sequential(
+                torch_module.nn.Linear(input_dim, hidden_dim),
+                torch_module.nn.GELU(),
+                torch_module.nn.Dropout(p=0.1),
+                torch_module.nn.Linear(hidden_dim, output_dim),
+            )
+        else:
+            projector = torch_module.nn.Sequential(
+                torch_module.nn.Linear(input_dim, hidden_dim),
+                torch_module.nn.GELU(),
+                torch_module.nn.Linear(hidden_dim, output_dim),
+            )
+
+        projector_state_dict = {}
+        for key, value in state_dict.items():
+            if key.startswith("net."):
+                projector_state_dict[key[len("net.") :]] = value
+            elif key.startswith("projector.net."):
+                projector_state_dict[key[len("projector.net.") :]] = value
+            elif key.startswith("projector."):
+                projector_state_dict[key[len("projector.") :]] = value
+            else:
+                projector_state_dict[key] = value
+
+        projector.load_state_dict(projector_state_dict, strict=True)
+        projector.to(self._resolved_device)
+        projector.eval()
+        self.projector = projector
 
     @staticmethod
     def _sample_frames(frames: List[Any], sample_count: int) -> List[Any]:

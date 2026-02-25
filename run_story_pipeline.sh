@@ -107,8 +107,13 @@ DIRECTOR_MODEL_ID="${DIRECTOR_MODEL_ID:-}"
 DIRECTOR_TEMPERATURE="${DIRECTOR_TEMPERATURE:-0.3}"
 EMBEDDING_BACKEND="${EMBEDDING_BACKEND:-dinov2}"
 EMBEDDING_MODEL_ID="${EMBEDDING_MODEL_ID:-}"
+EMBEDDING_ADAPTER_CKPT="${EMBEDDING_ADAPTER_CKPT:-}"
 LAST_FRAME_MEMORY="${LAST_FRAME_MEMORY:-1}"
 CONTINUITY_CANDIDATES="${CONTINUITY_CANDIDATES:-2}"
+ENVIRONMENT_MEMORY="${ENVIRONMENT_MEMORY:-1}"
+TRANSITION_WEIGHT="${TRANSITION_WEIGHT:-0.65}"
+ENVIRONMENT_WEIGHT="${ENVIRONMENT_WEIGHT:-0.35}"
+SCENE_CHANGE_ENV_DECAY="${SCENE_CHANGE_ENV_DECAY:-0.25}"
 DRY_RUN="0"
 AUTO_FALLBACK_DRY_RUN="${AUTO_FALLBACK_DRY_RUN:-0}"
 STYLE_PREFIX="${STYLE_PREFIX:-cinematic realistic, coherent motion, stable camera, high detail}"
@@ -116,7 +121,7 @@ CHARACTER_LOCK="${CHARACTER_LOCK:-one rabbit and one tortoise only; keep same ap
 NEGATIVE_PROMPT="${NEGATIVE_PROMPT:-blurry, low quality, flicker, frame jitter, deformed anatomy, duplicate subjects, extra limbs, extra animals, wrong species, text, subtitles, watermark, logo, collage, split-screen, glitch}"
 NUM_FRAMES="${NUM_FRAMES:-49}"
 STEPS="${STEPS:-35}"
-GUIDANCE_SCALE="${GUIDANCE_SCALE:-6.0}"
+GUIDANCE_SCALE="${GUIDANCE_SCALE:-12.0}"
 HEIGHT="${HEIGHT:-480}"
 WIDTH="${WIDTH:-832}"
 FPS="${FPS:-8}"
@@ -126,6 +131,15 @@ OUTPUT_DIR="${OUTPUT_DIR:-outputs/story_run_${RUN_STAMP}}"
 
 if [ "${EMBEDDING_BACKEND}" = "dinov2" ] && [ -z "${EMBEDDING_MODEL_ID}" ]; then
   EMBEDDING_MODEL_ID="${DINOV2_LOCAL_MODEL}"
+fi
+
+if [ -z "${EMBEDDING_ADAPTER_CKPT}" ] && [ -f "${PROJECT_ROOT}/outputs/pororo_continuity_adapter.pt" ]; then
+  EMBEDDING_ADAPTER_CKPT="${PROJECT_ROOT}/outputs/pororo_continuity_adapter.pt"
+fi
+
+if [ -n "${EMBEDDING_ADAPTER_CKPT}" ] && [ ! -f "${EMBEDDING_ADAPTER_CKPT}" ]; then
+  echo "EMBEDDING_ADAPTER_CKPT is set but file does not exist: ${EMBEDDING_ADAPTER_CKPT}"
+  exit 1
 fi
 
 if [ "${USE_OFFLINE_MODE}" = "1" ] && [ "${EMBEDDING_BACKEND}" = "dinov2" ]; then
@@ -247,11 +261,30 @@ fi
 if supports_flag "--embedding_model_id" && [ -n "${EMBEDDING_MODEL_ID}" ]; then
   CMD+=(--embedding_model_id "${EMBEDDING_MODEL_ID}")
 fi
+if supports_flag "--embedding_adapter_ckpt" && [ -n "${EMBEDDING_ADAPTER_CKPT}" ]; then
+  CMD+=(--embedding_adapter_ckpt "${EMBEDDING_ADAPTER_CKPT}")
+fi
 if supports_flag "--continuity_candidates"; then
   CMD+=(--continuity_candidates "${CONTINUITY_CANDIDATES}")
 fi
 if supports_flag "--last_frame_memory" && [ "${LAST_FRAME_MEMORY}" = "1" ]; then
   CMD+=(--last_frame_memory)
+fi
+if supports_flag "--environment_memory"; then
+  if [ "${ENVIRONMENT_MEMORY}" = "1" ]; then
+    CMD+=(--environment_memory)
+  else
+    CMD+=(--no-environment_memory)
+  fi
+fi
+if supports_flag "--transition_weight"; then
+  CMD+=(--transition_weight "${TRANSITION_WEIGHT}")
+fi
+if supports_flag "--environment_weight"; then
+  CMD+=(--environment_weight "${ENVIRONMENT_WEIGHT}")
+fi
+if supports_flag "--scene_change_env_decay"; then
+  CMD+=(--scene_change_env_decay "${SCENE_CHANGE_ENV_DECAY}")
 fi
 if [ -n "${DIRECTOR_MODEL_ID}" ]; then
   CMD+=(--director_model_id "${DIRECTOR_MODEL_ID}")
@@ -273,8 +306,13 @@ echo "CHARACTER_LOCK=${CHARACTER_LOCK}"
 echo "NEGATIVE_PROMPT=${NEGATIVE_PROMPT}"
 echo "EMBEDDING_BACKEND=${EMBEDDING_BACKEND}"
 echo "EMBEDDING_MODEL_ID=${EMBEDDING_MODEL_ID}"
+echo "EMBEDDING_ADAPTER_CKPT=${EMBEDDING_ADAPTER_CKPT}"
 echo "LAST_FRAME_MEMORY=${LAST_FRAME_MEMORY}"
 echo "CONTINUITY_CANDIDATES=${CONTINUITY_CANDIDATES}"
+echo "ENVIRONMENT_MEMORY=${ENVIRONMENT_MEMORY}"
+echo "TRANSITION_WEIGHT=${TRANSITION_WEIGHT}"
+echo "ENVIRONMENT_WEIGHT=${ENVIRONMENT_WEIGHT}"
+echo "SCENE_CHANGE_ENV_DECAY=${SCENE_CHANGE_ENV_DECAY}"
 echo "NUM_FRAMES=${NUM_FRAMES}"
 echo "STEPS=${STEPS}"
 echo "GUIDANCE_SCALE=${GUIDANCE_SCALE}"

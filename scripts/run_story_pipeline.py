@@ -1,5 +1,6 @@
 import argparse
 import json
+import re
 import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -28,6 +29,7 @@ def export_jsonl(rows: List[Dict[str, Any]], out_path: Path) -> None:
 def maybe_init_embedder(
     backend: str,
     model_id: Optional[str],
+    adapter_ckpt: Optional[str],
     device: str,
 ) -> Optional[VisionEmbedder]:
     if backend == "none":
@@ -36,6 +38,7 @@ def maybe_init_embedder(
         VisionEmbedderConfig(
             backend=backend,
             model_id=model_id,
+            adapter_ckpt=adapter_ckpt,
             device=device,
         )
     )
@@ -48,14 +51,27 @@ def build_generation_prompt(
     beat: str,
     style_prefix: str,
     character_lock: str,
+    environment_anchor: str,
+    scene_change_requested: bool,
 ) -> str:
     parts = []
     if style_prefix.strip():
         parts.append(style_prefix.strip())
     if character_lock.strip():
         parts.append(f"Character continuity: {character_lock.strip()}")
+    if environment_anchor.strip():
+        if scene_change_requested:
+            parts.append(f"Previous environment anchor (transition smoothly): {environment_anchor.strip()}")
+        else:
+            parts.append(f"Environment continuity anchor: {environment_anchor.strip()}")
     parts.append(f"Current beat: {beat.strip()}")
     parts.append(f"Shot prompt: {refined_prompt.strip()}")
+    if scene_change_requested:
+        parts.append("Beat suggests a setting change; transition from the previous clip naturally, not abruptly.")
+    elif environment_anchor.strip():
+        parts.append(
+            "Preserve location, background layout, lighting, weather, time-of-day, and camera viewpoint from the environment anchor."
+        )
     parts.append(
         "Strictly follow the current beat and keep the same characters, identities, and scene context. "
         "No unrelated objects, no random scene changes."
@@ -79,6 +95,99 @@ def _cosine_similarity(v1: Optional[Any], v2: Optional[Any]) -> Optional[float]:
     arr2 = np.asarray(v2)
     denom = (np.linalg.norm(arr1) * np.linalg.norm(arr2)) + 1e-12
     return float(np.dot(arr1, arr2) / denom)
+
+
+def _extract_environment_anchor(prompt: str) -> str:
+    if not prompt:
+        return ""
+    parts = re.split(r"[.;]", prompt)
+    env_keywords = (
+        "location",
+        "setting",
+        "environment",
+        "background",
+        "scene",
+        "room",
+        "house",
+        "street",
+        "forest",
+        "field",
+        "park",
+        "beach",
+        "mountain",
+        "indoor",
+        "outdoor",
+        "interior",
+        "exterior",
+        "sky",
+        "rain",
+        "snow",
+        "fog",
+        "sunset",
+        "night",
+        "daylight",
+        "lighting",
+        "camera",
+    )
+    selected: List[str] = []
+    for part in parts:
+        candidate = " ".join(part.strip().split())
+        if not candidate:
+            continue
+        lower = candidate.lower()
+        if any(token in lower for token in env_keywords):
+            selected.append(candidate)
+        if len(selected) >= 2:
+            break
+    if selected:
+        return "; ".join(selected)[:260]
+    fallback = " ".join(prompt.strip().split())
+    return fallback[:220]
+
+
+def _beat_requests_scene_change(beat: str) -> bool:
+    text = (beat or "").lower()
+    hints = (
+        "new location",
+        "cut to",
+        "arrive",
+        "arrives",
+        "enter",
+        "enters",
+        "exit",
+        "leave",
+        "leaves",
+        "move to",
+        "moves to",
+        "travel",
+        "travels",
+        "inside",
+        "outside",
+        "indoors",
+        "outdoors",
+        "back at",
+    )
+    return any(token in text for token in hints)
+
+
+def _combine_continuity_score(
+    transition_similarity: Optional[float],
+    environment_similarity: Optional[float],
+    transition_weight: float,
+    environment_weight: float,
+) -> Optional[float]:
+    weighted_components = []
+    if transition_similarity is not None and transition_weight > 0.0:
+        weighted_components.append((transition_similarity, transition_weight))
+    if environment_similarity is not None and environment_weight > 0.0:
+        weighted_components.append((environment_similarity, environment_weight))
+    if not weighted_components:
+        return None
+    total_weight = sum(weight for _, weight in weighted_components)
+    if total_weight <= 0.0:
+        return None
+    weighted_sum = sum(score * weight for score, weight in weighted_components)
+    return float(weighted_sum / total_weight)
 
 
 def main() -> None:
@@ -132,6 +241,12 @@ def main() -> None:
     parser.add_argument("--embedding_backend", type=str, default="clip", choices=["none", "clip", "dinov2"])
     parser.add_argument("--embedding_model_id", type=str, default="", help="Optional embedder model id.")
     parser.add_argument(
+        "--embedding_adapter_ckpt",
+        type=str,
+        default="",
+        help="Optional continuity adapter checkpoint (.pt) for the visual embedder.",
+    )
+    parser.add_argument(
         "--last_frame_memory",
         action="store_true",
         help="Use previous clip last-frame embedding to rank candidate next clips by first-frame continuity.",
@@ -140,7 +255,31 @@ def main() -> None:
         "--continuity_candidates",
         type=int,
         default=1,
-        help="Candidate clips per window when last-frame memory is available (higher is slower).",
+        help="Candidate clips per window when continuity ranking is enabled (higher is slower).",
+    )
+    parser.add_argument(
+        "--environment_memory",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use previous clip embedding to preserve environment across windows.",
+    )
+    parser.add_argument(
+        "--transition_weight",
+        type=float,
+        default=0.65,
+        help="Weight for first-frame to previous-last-frame similarity in candidate ranking.",
+    )
+    parser.add_argument(
+        "--environment_weight",
+        type=float,
+        default=0.35,
+        help="Weight for whole-clip environment similarity in candidate ranking.",
+    )
+    parser.add_argument(
+        "--scene_change_env_decay",
+        type=float,
+        default=0.25,
+        help="Multiplier for environment_weight when beat indicates a location/setting change.",
     )
     parser.add_argument("--dry_run", action="store_true", help="Only plan/refine prompts. No video generation.")
     args = parser.parse_args()
@@ -178,6 +317,7 @@ def main() -> None:
         embedder = maybe_init_embedder(
             backend=args.embedding_backend,
             model_id=args.embedding_model_id or None,
+            adapter_ckpt=args.embedding_adapter_ckpt or None,
             device=args.device,
         )
         memory = NarrativeMemory()
@@ -185,9 +325,12 @@ def main() -> None:
     previous_prompt = ""
     memory_feedback = None
     previous_last_frame_embedding = None
+    previous_clip_embedding = None
+    previous_environment_anchor = ""
     log_rows: List[Dict[str, Any]] = []
 
     for window in windows:
+        scene_change_requested = _beat_requests_scene_change(window.beat)
         refined_prompt = director.refine_prompt(
             storyline=args.storyline,
             window=window,
@@ -199,6 +342,8 @@ def main() -> None:
             beat=window.beat,
             style_prefix=args.style_prefix,
             character_lock=args.character_lock,
+            environment_anchor=previous_environment_anchor,
+            scene_change_requested=scene_change_requested,
         )
 
         clip_path = clips_dir / f"window_{window.index:03d}.mp4"
@@ -209,6 +354,8 @@ def main() -> None:
             "prompt_seed": window.prompt_seed,
             "refined_prompt": refined_prompt,
             "generation_prompt": generation_prompt,
+            "scene_change_requested": scene_change_requested,
+            "environment_anchor": previous_environment_anchor,
             "negative_prompt": args.negative_prompt,
             "clip_path": clip_path.as_posix(),
             "generated": False,
@@ -217,17 +364,31 @@ def main() -> None:
 
         if not args.dry_run:
             base_seed = None if args.seed is None else args.seed + window.index
+            transition_ref_available = (
+                embedder is not None and args.last_frame_memory and previous_last_frame_embedding is not None
+            )
+            environment_ref_available = (
+                embedder is not None and args.environment_memory and previous_clip_embedding is not None
+            )
             continuity_active = (
                 embedder is not None
-                and args.last_frame_memory
-                and previous_last_frame_embedding is not None
                 and args.continuity_candidates > 1
+                and (transition_ref_available or environment_ref_available)
             )
             num_candidates = args.continuity_candidates if continuity_active else 1
             candidate_rows: List[Dict[str, Any]] = []
             best_frames = None
             best_seed = base_seed
             best_transition_similarity = None
+            best_environment_similarity = None
+            best_continuity_score = None
+            best_clip_embedding = None
+
+            transition_weight = max(0.0, float(args.transition_weight))
+            environment_weight = max(0.0, float(args.environment_weight))
+            if scene_change_requested:
+                scene_change_decay = max(0.0, float(args.scene_change_env_decay))
+                environment_weight *= scene_change_decay
 
             for candidate_idx in range(num_candidates):
                 candidate_seed = None
@@ -249,11 +410,26 @@ def main() -> None:
                     candidate_first_embedding = embedder.embed_first_frame(candidate_frames)
                     transition_similarity = _cosine_similarity(candidate_first_embedding, previous_last_frame_embedding)
 
+                environment_similarity = None
+                candidate_embedding = None
+                if embedder is not None and args.environment_memory and previous_clip_embedding is not None:
+                    candidate_embedding = embedder.embed_frames(candidate_frames)
+                    environment_similarity = _cosine_similarity(candidate_embedding, previous_clip_embedding)
+
+                continuity_score = _combine_continuity_score(
+                    transition_similarity=transition_similarity,
+                    environment_similarity=environment_similarity,
+                    transition_weight=transition_weight,
+                    environment_weight=environment_weight,
+                )
+
                 candidate_rows.append(
                     {
                         "candidate_index": candidate_idx,
                         "seed": candidate_seed,
                         "transition_similarity": transition_similarity,
+                        "environment_similarity": environment_similarity,
+                        "continuity_score": continuity_score,
                     }
                 )
 
@@ -261,12 +437,18 @@ def main() -> None:
                     best_frames = candidate_frames
                     best_seed = candidate_seed
                     best_transition_similarity = transition_similarity
-                elif transition_similarity is not None and (
-                    best_transition_similarity is None or transition_similarity > best_transition_similarity
+                    best_environment_similarity = environment_similarity
+                    best_continuity_score = continuity_score
+                    best_clip_embedding = candidate_embedding
+                elif continuity_score is not None and (
+                    best_continuity_score is None or continuity_score > best_continuity_score
                 ):
                     best_frames = candidate_frames
                     best_seed = candidate_seed
                     best_transition_similarity = transition_similarity
+                    best_environment_similarity = environment_similarity
+                    best_continuity_score = continuity_score
+                    best_clip_embedding = candidate_embedding
 
             frames = best_frames
             window_seed = best_seed
@@ -275,11 +457,13 @@ def main() -> None:
             row["seed"] = window_seed
             row["continuity_candidates"] = num_candidates
             row["selected_transition_similarity"] = best_transition_similarity
+            row["selected_environment_similarity"] = best_environment_similarity
+            row["selected_continuity_score"] = best_continuity_score
             if len(candidate_rows) > 1:
                 row["candidate_scores"] = candidate_rows
 
             if embedder is not None and memory is not None:
-                embedding = embedder.embed_frames(frames)
+                embedding = best_clip_embedding if best_clip_embedding is not None else embedder.embed_frames(frames)
                 memory_feedback = memory.register_window(
                     window.index,
                     embedding,
@@ -288,8 +472,13 @@ def main() -> None:
                 row["memory_feedback"] = memory_feedback.to_dict()
                 if args.last_frame_memory:
                     previous_last_frame_embedding = embedder.embed_last_frame(frames)
+                if args.environment_memory:
+                    previous_clip_embedding = embedding
 
         previous_prompt = _compact_previous_prompt(refined_prompt)
+        next_environment_anchor = _extract_environment_anchor(refined_prompt)
+        if next_environment_anchor:
+            previous_environment_anchor = next_environment_anchor
         log_rows.append(row)
         print(f"[scene {window.index:03d}] {window.start_sec}-{window.end_sec}s ready")
 
@@ -303,8 +492,13 @@ def main() -> None:
         "director_model_id": args.director_model_id or None,
         "video_model_id": None if args.dry_run else args.video_model_id,
         "embedding_backend": args.embedding_backend,
+        "embedding_adapter_ckpt": args.embedding_adapter_ckpt or None,
         "last_frame_memory": args.last_frame_memory,
         "continuity_candidates": args.continuity_candidates,
+        "environment_memory": args.environment_memory,
+        "transition_weight": args.transition_weight,
+        "environment_weight": args.environment_weight,
+        "scene_change_env_decay": args.scene_change_env_decay,
         "output_dir": out_dir.as_posix(),
         "run_log": (out_dir / "run_log.jsonl").as_posix(),
     }

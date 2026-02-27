@@ -6,6 +6,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, List, Optional
 
+import numpy as np
+
 
 @dataclass
 class WanBackboneConfig:
@@ -191,9 +193,55 @@ class WanBackbone:
         frames = getattr(result, "frames", None)
         if frames is None:
             raise RuntimeError("Pipeline output does not contain `frames`.")
-        if len(frames) > 0 and isinstance(frames[0], list):
-            return frames[0]
-        return frames
+
+        clip_frames = self._select_single_clip(frames)
+        if len(clip_frames) == 0:
+            raise RuntimeError("Selected clip is empty.")
+        return clip_frames
+
+    @staticmethod
+    def _select_single_clip(frames: Any) -> List[Any]:
+        """
+        Normalize different diffusers outputs to exactly one clip.
+        This prevents accidental concatenation when batched clips are returned.
+        """
+        # List[List[frame]] -> batch of clips. Keep first clip.
+        if isinstance(frames, list):
+            if len(frames) == 0:
+                return []
+            first = frames[0]
+            if isinstance(first, list):
+                return first
+
+            # List[np.ndarray(T,H,W,C)] or List[np.ndarray(T,C,H,W)] -> batch of clips.
+            arr0 = np.asarray(first)
+            if arr0.ndim == 4:
+                if arr0.shape[-1] in (1, 2, 3, 4):
+                    return [arr0[i] for i in range(arr0.shape[0])]
+                if arr0.shape[1] in (1, 2, 3, 4):
+                    return [np.transpose(arr0[i], (1, 2, 0)) for i in range(arr0.shape[0])]
+
+            # Already List[frame].
+            return frames
+
+        arr = np.asarray(frames)
+
+        # np.ndarray(B,T,H,W,C) or np.ndarray(B,T,C,H,W): batch of clips.
+        if arr.ndim == 5:
+            arr = arr[0]
+
+        # np.ndarray(T,H,W,C) or np.ndarray(T,C,H,W): one clip.
+        if arr.ndim == 4:
+            if arr.shape[-1] in (1, 2, 3, 4):
+                return [arr[i] for i in range(arr.shape[0])]
+            if arr.shape[1] in (1, 2, 3, 4):
+                return [np.transpose(arr[i], (1, 2, 0)) for i in range(arr.shape[0])]
+
+        # Fallback: treat as sequence or single frame.
+        try:
+            return list(frames)
+        except TypeError:
+            return [frames]
 
     @staticmethod
     def save_video(frames: List[Any], output_path: str, fps: int = 8) -> None:
@@ -202,7 +250,6 @@ class WanBackbone:
 
         try:
             import imageio.v3 as iio
-            import numpy as np
         except ImportError as exc:
             raise ImportError("imageio is required to save MP4/GIF outputs.") from exc
 

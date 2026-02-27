@@ -2,56 +2,61 @@
 #SBATCH --job-name=sceneweaver_full
 #SBATCH --output=slurm_logs/sceneweaver_%j.out
 #SBATCH --error=slurm_logs/sceneweaver_%j.err
-#SBATCH --time=3:00:00
-#SBATCH --partition=a40
-#SBATCH --gres=gpu:a40:1
+#SBATCH --time=1:50:00
+#SBATCH --partition=a100
+#SBATCH --gres=gpu:a100:2
+#SBATCH --cpus-per-task=16
+
 set -euo pipefail
 
-
-module purge
-module load python
-cd /home/hpc/v123be/v123be36/Multimodal_Final_SceneWeaver/
 # Some cluster profile scripts assume this exists; keep nounset-safe default.
 export LD_LIBRARY_PATH="${LD_LIBRARY_PATH:-}"
+
 # Defaults are portable; override with env vars if needed.
-# Under Slurm, prefer the original submit directory instead of spool staging.
 DEFAULT_PROJECT_ROOT="${SLURM_SUBMIT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
 PROJECT_ROOT="${PROJECT_ROOT:-${DEFAULT_PROJECT_ROOT}}"
+
 ENV_PATH="${ENV_PATH:-}"
 VENV_PATH="${VENV_PATH:-}"
-DEFAULT_ENV_PATH="${DEFAULT_ENV_PATH:-sceneweaver_runtime}"
-WAN_LOCAL_MODEL="${WAN_LOCAL_MODEL:-/home/vault/v123be/v123be36/Wan2.1-T2V-1.3B-Diffusers}"
+DEFAULT_ENV_PATH="${DEFAULT_ENV_PATH:-sceneweaver311}"
+
+WAN_LOCAL_MODEL="${WAN_LOCAL_MODEL:-${PROJECT_ROOT}/models/Wan2.1-T2V-1.3B-Diffusers}"
+
 CONDA_SH="${CONDA_SH:-/apps/python/3.12-conda/etc/profile.d/conda.sh}"
-USE_MODULES="${USE_MODULES:-1}"
+USE_MODULES="${USE_MODULES:-0}"
 PYTHON_MODULE="${PYTHON_MODULE:-python/3.12-conda}"
 CUDA_MODULE="${CUDA_MODULE:-cuda/12.4.1}"
+
 USE_OFFLINE_MODE="${USE_OFFLINE_MODE:-1}"
-DEVICE="${DEVICE:-auto}"
+DEVICE="${DEVICE:-cuda}"
 STRICT_DEVICE="${STRICT_DEVICE:-0}"
 PYTHON_BIN="${PYTHON_BIN:-}"
+
 DOWNLOAD_MODEL="${DOWNLOAD_MODEL:-0}"
 MODEL_REPO="${MODEL_REPO:-Wan-AI/Wan2.1-T2V-1.3B-Diffusers}"
 MODEL_DIR="${MODEL_DIR:-${PROJECT_ROOT}/models/$(basename "${MODEL_REPO}")}"
-# Keep this narrow to avoid full snapshot downloads.
 MODEL_INCLUDE="${MODEL_INCLUDE:-*.safetensors *.json *.txt tokenizer* *.model}"
-DINOV2_LOCAL_MODEL="${DINOV2_LOCAL_MODEL:-/home/vault/v123be/v123be36/facebook/dinov2-base}"
+DOWNLOAD_DIRECTOR_MODEL="${DOWNLOAD_DIRECTOR_MODEL:-0}"
+DIRECTOR_MODEL_REPO="${DIRECTOR_MODEL_REPO:-Qwen/Qwen2.5-3B-Instruct}"
+DIRECTOR_MODEL_DIR="${DIRECTOR_MODEL_DIR:-${PROJECT_ROOT}/models/$(basename "${DIRECTOR_MODEL_REPO}")}"
+DIRECTOR_MODEL_INCLUDE="${DIRECTOR_MODEL_INCLUDE:-*.safetensors *.json *.txt tokenizer* *.model}"
 
-# Optional HPC module setup (kept off by default for local/pool PCs).
+DINOV2_LOCAL_MODEL="${DINOV2_LOCAL_MODEL:-${PROJECT_ROOT}/models/dinov2-base}"
+
+# Optional HPC module setup.
 if [ "${USE_MODULES}" = "1" ] && command -v module >/dev/null 2>&1; then
-  if ! module purge; then
-    echo "Warning: module purge failed; continuing."
-  fi
-  if [ -n "${PYTHON_MODULE}" ] && ! module load "${PYTHON_MODULE}"; then
-    echo "Warning: could not load Python module '${PYTHON_MODULE}'."
-  fi
-  if [ -n "${CUDA_MODULE}" ] && ! module load "${CUDA_MODULE}"; then
-    echo "Warning: could not load CUDA module '${CUDA_MODULE}'; continuing without module load."
-    echo "Set CUDA_MODULE to a valid module name, or set USE_MODULES=0 to skip modules."
-  fi
+  module purge || true
+  [ -n "${PYTHON_MODULE}" ] && module load "${PYTHON_MODULE}" || true
+  [ -n "${CUDA_MODULE}" ] && module load "${CUDA_MODULE}" || true
 fi
 
 mkdir -p "${PROJECT_ROOT}/slurm_logs" "${PROJECT_ROOT}/outputs" "${PROJECT_ROOT}/.hf"
 cd "${PROJECT_ROOT}"
+
+# If an env is already active in the current shell, keep it by default.
+if [ -n "${CONDA_DEFAULT_ENV:-}" ] && [ -z "${ENV_PATH}" ] && [ -z "${VENV_PATH}" ]; then
+  ENV_PATH="${CONDA_DEFAULT_ENV}"
+fi
 
 # Optional default env when neither ENV_PATH nor VENV_PATH is provided.
 if [ -z "${ENV_PATH}" ] && [ -z "${VENV_PATH}" ] && [ -n "${DEFAULT_ENV_PATH}" ]; then
@@ -64,37 +69,111 @@ if [ -n "${ENV_PATH}" ]; then
     # shellcheck disable=SC1090
     source "${CONDA_SH}"
   fi
-  if ! command -v conda >/dev/null 2>&1; then
-    echo "Conda command not found. Set CONDA_SH correctly or activate env before running."
-    exit 1
-  fi
+  command -v conda >/dev/null 2>&1 || { echo "Conda command not found. Set CONDA_SH correctly or activate env before running."; exit 1; }
   conda activate "${ENV_PATH}"
 elif [ -n "${VENV_PATH}" ]; then
-  if [ ! -f "${VENV_PATH}/bin/activate" ]; then
-    echo "Virtualenv activate script not found at ${VENV_PATH}/bin/activate"
-    exit 1
-  fi
+  [ -f "${VENV_PATH}/bin/activate" ] || { echo "Virtualenv activate script not found at ${VENV_PATH}/bin/activate"; exit 1; }
   # shellcheck disable=SC1090
   source "${VENV_PATH}/bin/activate"
 fi
 
 export PYTHONUNBUFFERED=1
-# Prevent ~/.local packages from shadowing the conda env on cluster nodes.
 export PYTHONNOUSERSITE=1
 export HF_HOME="${HF_HOME:-${PROJECT_ROOT}/.hf}"
 
-# Online mode is default for pool PCs; enable offline only if local model/cache exists.
+if [ "${USE_OFFLINE_MODE}" = "1" ] && { [ "${DOWNLOAD_MODEL}" = "1" ] || [ "${DOWNLOAD_DIRECTOR_MODEL}" = "1" ]; }; then
+  echo "USE_OFFLINE_MODE=1 conflicts with model download. Switching to online mode for this run."
+  USE_OFFLINE_MODE="0"
+fi
+
 if [ "${USE_OFFLINE_MODE}" = "1" ]; then
   export HF_HUB_OFFLINE=1
   export TRANSFORMERS_OFFLINE=1
   export DIFFUSERS_OFFLINE=1
 fi
 
-# Override any of these at runtime, e.g.:
-# STORYLINE="..." TOTAL_MINUTES=2 bash run_story_pipeline.sh
-STORYLINE="${STORYLINE:-A race starts between a rabbit and a tortoise, rabbit sprints early, then slows, tortoise steadily advances and wins.}"
-TOTAL_MINUTES="${TOTAL_MINUTES:-5}"
-WINDOW_SECONDS="${WINDOW_SECONDS:-10}"
+# STORYLINE
+if [ -z "${STORYLINE:-}" ]; then
+  STORYLINE="$(cat <<'STORY_EOF'
+A thirsty crow finds a pot with very little water. The crow carries small stones one by one and drops them into the pot. As more stones fall in, the water level rises gradually. At last, the crow can reach the water and drinks.
+STORY_EOF
+)"
+fi
+
+if [ -z "${STYLE_PREFIX:-}" ]; then
+  STYLE_PREFIX="$(cat <<'STYLE_EOF'
+cinematic realistic drama, natural skin tones, stable camera, coherent motion, soft depth of field, high detail, grounded everyday realism
+STYLE_EOF
+)"
+fi
+
+if [ -z "${CHARACTER_LOCK:-}" ]; then
+  CHARACTER_LOCK="$(cat <<'CHAR_EOF'
+exactly one crow with consistent appearance across all windows: glossy black feathers, medium size, sharp beak, bright eyes. Keep one clay pot and small pebbles/stones consistent in shape and color. No extra animals, no humans, no crowds, no duplicate or cloned crows.
+CHAR_EOF
+)"
+fi
+
+if [ -z "${GLOBAL_CONTINUITY_ANCHOR:-}" ]; then
+  GLOBAL_CONTINUITY_ANCHOR="$(cat <<'ANCHOR_EOF'
+All windows occur in the same outdoor courtyard. Anchor objects must stay: one clay pot on a small wooden table, scattered pebbles near the table, one tree branch where the crow perches, warm daylight. Keep identical courtyard layout, object positions, and lighting progression. No random location changes, no teleporting objects, no sky-falling stones.
+ANCHOR_EOF
+)"
+fi
+
+if [ -z "${NEGATIVE_PROMPT:-}" ]; then
+  NEGATIVE_PROMPT="$(cat <<'NEG_EOF'
+blurry, low quality, flicker, frame jitter, deformed anatomy, extra limbs, duplicate people, cloned faces, twin characters, repeated character in frame, crowd, background people, strangers, extra humans, extra children, extra women, extra men, inconsistent face, identity drift, face morph, different person, different outfit, wardrobe change, different hairstyle, different location, different room layout, different furniture, inconsistent background, scene change, teleport, background swap, text overlay, subtitles, watermark, logo, collage, split-screen, glitch
+NEG_EOF
+)"
+fi
+
+TOTAL_MINUTES="${TOTAL_MINUTES:-1}"
+FPS="${FPS:-12}"
+WINDOW_SECONDS="${WINDOW_SECONDS:-8}"
+NUM_FRAMES="${NUM_FRAMES:-96}"
+STEPS="${STEPS:-30}"
+GUIDANCE_SCALE="${GUIDANCE_SCALE:-6.0}"
+HEIGHT="${HEIGHT:-480}"
+WIDTH="${WIDTH:-832}"
+SEED="${SEED:-42}"
+SEED_STRATEGY="${SEED_STRATEGY:-fixed}"
+
+if [ -z "${DIRECTOR_MODEL_ID:-}" ] && [ -d "${DIRECTOR_MODEL_DIR}" ]; then
+  DIRECTOR_MODEL_ID="${DIRECTOR_MODEL_DIR}"
+else
+  DIRECTOR_MODEL_ID="${DIRECTOR_MODEL_ID:-}"
+fi
+DIRECTOR_TEMPERATURE="${DIRECTOR_TEMPERATURE:-0.05}"
+
+EMBEDDING_BACKEND="${EMBEDDING_BACKEND:-dinov2}"
+EMBEDDING_MODEL_ID="${EMBEDDING_MODEL_ID:-${DINOV2_LOCAL_MODEL}}"
+LAST_FRAME_MEMORY="${LAST_FRAME_MEMORY:-1}"
+CONTINUITY_CANDIDATES="${CONTINUITY_CANDIDATES:-8}"
+CONTINUITY_MIN_SCORE="${CONTINUITY_MIN_SCORE:-0.72}"
+CONTINUITY_REGEN_ATTEMPTS="${CONTINUITY_REGEN_ATTEMPTS:-2}"
+CRITIC_STORY_WEIGHT="${CRITIC_STORY_WEIGHT:-0.15}"
+ENVIRONMENT_MEMORY="${ENVIRONMENT_MEMORY:-1}"
+TRANSITION_WEIGHT="${TRANSITION_WEIGHT:-0.65}"
+ENVIRONMENT_WEIGHT="${ENVIRONMENT_WEIGHT:-0.35}"
+SCENE_CHANGE_ENV_DECAY="${SCENE_CHANGE_ENV_DECAY:-0.25}"
+
+EMBEDDING_ADAPTER_CKPT="${EMBEDDING_ADAPTER_CKPT:-${PROJECT_ROOT}/outputs/pororo_continuity_adapter.pt}"
+
+DRY_RUN="${DRY_RUN:-0}"
+RUN_STAMP="$(date +%Y%m%d_%H%M%S)"
+OUTPUT_DIR="${OUTPUT_DIR:-outputs/story_run_${RUN_STAMP}}"
+COMBINE_WINDOWS="${COMBINE_WINDOWS:-0}"
+COMBINED_VIDEO_NAME="${COMBINED_VIDEO_NAME:-story_windows_concat.mp4}"
+RUN_REPAIR_PASS="${RUN_REPAIR_PASS:-0}"
+REPAIR_REPLACE_ORIGINAL="${REPAIR_REPLACE_ORIGINAL:-1}"
+REPAIR_CANDIDATES="${REPAIR_CANDIDATES:-8}"
+REPAIR_ATTEMPTS="${REPAIR_ATTEMPTS:-3}"
+REPAIR_ACCEPT_SCORE="${REPAIR_ACCEPT_SCORE:-0.86}"
+REPAIR_TRANSITION_THRESHOLD="${REPAIR_TRANSITION_THRESHOLD:-0.84}"
+REPAIR_CRITIC_THRESHOLD="${REPAIR_CRITIC_THRESHOLD:-0.82}"
+
+# Select model id
 if [ -n "${WAN_LOCAL_MODEL}" ]; then
   DEFAULT_VIDEO_MODEL_ID="${WAN_LOCAL_MODEL}"
 elif [ -d "${MODEL_DIR}" ]; then
@@ -103,44 +182,6 @@ else
   DEFAULT_VIDEO_MODEL_ID="${MODEL_REPO}"
 fi
 VIDEO_MODEL_ID="${VIDEO_MODEL_ID:-${DEFAULT_VIDEO_MODEL_ID}}"
-DIRECTOR_MODEL_ID="${DIRECTOR_MODEL_ID:-}"
-DIRECTOR_TEMPERATURE="${DIRECTOR_TEMPERATURE:-0.3}"
-EMBEDDING_BACKEND="${EMBEDDING_BACKEND:-dinov2}"
-EMBEDDING_MODEL_ID="${EMBEDDING_MODEL_ID:-}"
-EMBEDDING_ADAPTER_CKPT="${EMBEDDING_ADAPTER_CKPT:-}"
-LAST_FRAME_MEMORY="${LAST_FRAME_MEMORY:-1}"
-CONTINUITY_CANDIDATES="${CONTINUITY_CANDIDATES:-2}"
-ENVIRONMENT_MEMORY="${ENVIRONMENT_MEMORY:-1}"
-TRANSITION_WEIGHT="${TRANSITION_WEIGHT:-0.65}"
-ENVIRONMENT_WEIGHT="${ENVIRONMENT_WEIGHT:-0.35}"
-SCENE_CHANGE_ENV_DECAY="${SCENE_CHANGE_ENV_DECAY:-0.25}"
-DRY_RUN="0"
-AUTO_FALLBACK_DRY_RUN="${AUTO_FALLBACK_DRY_RUN:-0}"
-STYLE_PREFIX="${STYLE_PREFIX:-cinematic realistic, coherent motion, stable camera, high detail}"
-CHARACTER_LOCK="${CHARACTER_LOCK:-one rabbit and one tortoise only; keep same appearance, size, and colors across all windows; no extra animals or humans}"
-NEGATIVE_PROMPT="${NEGATIVE_PROMPT:-blurry, low quality, flicker, frame jitter, deformed anatomy, duplicate subjects, extra limbs, extra animals, wrong species, text, subtitles, watermark, logo, collage, split-screen, glitch}"
-NUM_FRAMES="${NUM_FRAMES:-49}"
-STEPS="${STEPS:-35}"
-GUIDANCE_SCALE="${GUIDANCE_SCALE:-12.0}"
-HEIGHT="${HEIGHT:-480}"
-WIDTH="${WIDTH:-832}"
-FPS="${FPS:-8}"
-SEED="${SEED:-42}"
-RUN_STAMP="$(date +%Y%m%d_%H%M%S)"
-OUTPUT_DIR="${OUTPUT_DIR:-outputs/story_run_${RUN_STAMP}}"
-
-if [ "${EMBEDDING_BACKEND}" = "dinov2" ] && [ -z "${EMBEDDING_MODEL_ID}" ]; then
-  EMBEDDING_MODEL_ID="${DINOV2_LOCAL_MODEL}"
-fi
-
-if [ -z "${EMBEDDING_ADAPTER_CKPT}" ] && [ -f "${PROJECT_ROOT}/outputs/pororo_continuity_adapter.pt" ]; then
-  EMBEDDING_ADAPTER_CKPT="${PROJECT_ROOT}/outputs/pororo_continuity_adapter.pt"
-fi
-
-if [ -n "${EMBEDDING_ADAPTER_CKPT}" ] && [ ! -f "${EMBEDDING_ADAPTER_CKPT}" ]; then
-  echo "EMBEDDING_ADAPTER_CKPT is set but file does not exist: ${EMBEDDING_ADAPTER_CKPT}"
-  exit 1
-fi
 
 if [ "${USE_OFFLINE_MODE}" = "1" ] && [ "${EMBEDDING_BACKEND}" = "dinov2" ]; then
   if [ ! -f "${EMBEDDING_MODEL_ID}/preprocessor_config.json" ]; then
@@ -150,23 +191,21 @@ if [ "${USE_OFFLINE_MODE}" = "1" ] && [ "${EMBEDDING_BACKEND}" = "dinov2" ]; the
   fi
 fi
 
-# If a local model directory is provided, ensure it looks like a diffusers pipeline.
 if [ -d "${VIDEO_MODEL_ID}" ] && [ ! -f "${VIDEO_MODEL_ID}/model_index.json" ]; then
   echo "Local VIDEO_MODEL_ID is not a diffusers pipeline directory: ${VIDEO_MODEL_ID}"
   echo "Missing required file: ${VIDEO_MODEL_ID}/model_index.json"
-  if [ -f "${VIDEO_MODEL_ID}/config.json" ] && grep -q '"_class_name"[[:space:]]*:[[:space:]]*"WanModel"' "${VIDEO_MODEL_ID}/config.json"; then
-    echo "Detected native Wan checkpoint layout (WanModel config)."
-    echo "Current SceneWeaver runtime expects diffusers pipeline format for --video_model_id."
-  fi
-  echo "Set VIDEO_MODEL_ID to a diffusers-formatted local model directory."
   exit 1
 fi
 
-# Current runtime is text-only. Reject TI2V checkpoints to avoid low-quality/noise outputs.
 if echo "${VIDEO_MODEL_ID}" | grep -qi "TI2V"; then
   echo "VIDEO_MODEL_ID appears to be a TI2V model: ${VIDEO_MODEL_ID}"
-  echo "This pipeline currently provides text-only prompts and no image conditioning input."
-  echo "Use a T2V model (e.g., Wan2.1-T2V-1.3B-Diffusers) for stable scene generation."
+  echo "Use a T2V model for text-only generation."
+  exit 1
+fi
+
+# fail fast if adapter path is set but missing
+if [ -n "${EMBEDDING_ADAPTER_CKPT}" ] && [ ! -f "${EMBEDDING_ADAPTER_CKPT}" ]; then
+  echo "ERROR: embedding adapter checkpoint not found: ${EMBEDDING_ADAPTER_CKPT}"
   exit 1
 fi
 
@@ -176,25 +215,26 @@ if [ -z "${PYTHON_BIN}" ]; then
   elif command -v python3 >/dev/null 2>&1; then
     PYTHON_BIN="python3"
   else
-    echo "No Python interpreter found on PATH (python/python3)."
+    echo "No python/python3 found."
     exit 1
   fi
 fi
 
-# Optional selective model download (disabled by default).
-# Example:
-# DOWNLOAD_MODEL=1 MODEL_REPO=tencent/HunyuanVideo-1.5 bash run_story_pipeline.sh
-if [ "${DOWNLOAD_MODEL}" = "1" ]; then
-  mkdir -p "${MODEL_DIR}"
+# Optional selective model download.
+if [ "${DOWNLOAD_MODEL}" = "1" ] || [ "${DOWNLOAD_DIRECTOR_MODEL}" = "1" ]; then
   HF_DL=""
   if command -v hf >/dev/null 2>&1; then
     HF_DL="hf"
   elif command -v huggingface-cli >/dev/null 2>&1; then
     HF_DL="huggingface-cli"
   else
-    echo "No HF CLI found. Install 'huggingface_hub[cli]' or set VIDEO_MODEL_ID to a local path."
+    echo "No HF CLI found. Install huggingface_hub[cli] or set model paths to local directories."
     exit 1
   fi
+fi
+
+if [ "${DOWNLOAD_MODEL}" = "1" ]; then
+  mkdir -p "${MODEL_DIR}"
   # shellcheck disable=SC2206
   INCLUDE_ARR=(${MODEL_INCLUDE})
   HF_INCLUDE_ARGS=()
@@ -205,25 +245,27 @@ if [ "${DOWNLOAD_MODEL}" = "1" ]; then
   VIDEO_MODEL_ID="${MODEL_DIR}"
 fi
 
-# Preflight for real generation runtime on local/pool machines.
+if [ "${DOWNLOAD_DIRECTOR_MODEL}" = "1" ]; then
+  mkdir -p "${DIRECTOR_MODEL_DIR}"
+  # shellcheck disable=SC2206
+  D_INCLUDE_ARR=(${DIRECTOR_MODEL_INCLUDE})
+  D_HF_INCLUDE_ARGS=()
+  for pat in "${D_INCLUDE_ARR[@]}"; do
+    D_HF_INCLUDE_ARGS+=(--include "${pat}")
+  done
+  "${HF_DL}" download "${DIRECTOR_MODEL_REPO}" --local-dir "${DIRECTOR_MODEL_DIR}" "${D_HF_INCLUDE_ARGS[@]}"
+  DIRECTOR_MODEL_ID="${DIRECTOR_MODEL_DIR}"
+fi
+
 if [ "${DRY_RUN}" = "0" ]; then
   if [ "${DEVICE}" = "cuda" ] && ! "${PYTHON_BIN}" -c "import torch; assert torch.cuda.is_available()" >/dev/null 2>&1; then
     echo "DEVICE=cuda requested, but torch.cuda.is_available() is false in this environment."
-    if ! "${PYTHON_BIN}" -c "import torch; print('torch_version=' + str(torch.__version__)); print('torch_cuda_build=' + str(torch.version.cuda)); print('cuda_available=' + str(torch.cuda.is_available())); print('cuda_device_count=' + str(torch.cuda.device_count()))" 2>/dev/null; then
-      echo "Torch diagnostics unavailable (torch import failed in the active environment)."
-    fi
-    echo "Likely cause: CPU-only torch build in the active env, or a CUDA/runtime mismatch."
     if [ "${STRICT_DEVICE}" = "1" ]; then
       echo "STRICT_DEVICE=1 set; exiting."
       exit 1
     fi
     echo "Falling back to DEVICE=auto."
     DEVICE="auto"
-  fi
-  if ! "${PYTHON_BIN}" -c "import diffusers; assert hasattr(diffusers, 'AutoPipelineForText2Video') or hasattr(diffusers, 'DiffusionPipeline')" >/dev/null 2>&1; then
-    echo "Real generation runtime is not healthy on this machine (diffusers text2video pipeline unavailable)."
-    echo "Suggested fix in env: pip install -U 'diffusers>=0.30' transformers accelerate"
-    exit 1
   fi
 fi
 
@@ -232,25 +274,31 @@ supports_flag() {
   echo "${SCRIPT_HELP}" | grep -q -- "$1"
 }
 
+# Inject global continuity anchor into style context when supported.
+STYLE_PREFIX_COMBINED="${STYLE_PREFIX} Environment anchor: ${GLOBAL_CONTINUITY_ANCHOR}"
+
 CMD=("${PYTHON_BIN}" scripts/run_story_pipeline.py
-  --storyline "${STORYLINE}" \
-  --total_minutes "${TOTAL_MINUTES}" \
-  --window_seconds "${WINDOW_SECONDS}" \
-  --video_model_id "${VIDEO_MODEL_ID}" \
-  --director_temperature "${DIRECTOR_TEMPERATURE}" \
-  --embedding_backend "${EMBEDDING_BACKEND}" \
-  --num_frames "${NUM_FRAMES}" \
-  --steps "${STEPS}" \
-  --guidance_scale "${GUIDANCE_SCALE}" \
-  --height "${HEIGHT}" \
-  --width "${WIDTH}" \
-  --fps "${FPS}" \
-  --seed "${SEED}" \
-  --device "${DEVICE}" \
-  --output_dir "${OUTPUT_DIR}")
+  --storyline "${STORYLINE}"
+  --total_minutes "${TOTAL_MINUTES}"
+  --window_seconds "${WINDOW_SECONDS}"
+  --video_model_id "${VIDEO_MODEL_ID}"
+  --director_temperature "${DIRECTOR_TEMPERATURE}"
+  --embedding_backend "${EMBEDDING_BACKEND}"
+  --embedding_model_id "${EMBEDDING_MODEL_ID}"
+  --num_frames "${NUM_FRAMES}"
+  --steps "${STEPS}"
+  --guidance_scale "${GUIDANCE_SCALE}"
+  --height "${HEIGHT}"
+  --width "${WIDTH}"
+  --fps "${FPS}"
+  --seed "${SEED}"
+  --seed_strategy "${SEED_STRATEGY}"
+  --device "${DEVICE}"
+  --output_dir "${OUTPUT_DIR}"
+)
 
 if supports_flag "--style_prefix"; then
-  CMD+=(--style_prefix "${STYLE_PREFIX}")
+  CMD+=(--style_prefix "${STYLE_PREFIX_COMBINED}")
 fi
 if supports_flag "--character_lock"; then
   CMD+=(--character_lock "${CHARACTER_LOCK}")
@@ -258,17 +306,23 @@ fi
 if supports_flag "--negative_prompt"; then
   CMD+=(--negative_prompt "${NEGATIVE_PROMPT}")
 fi
-if supports_flag "--embedding_model_id" && [ -n "${EMBEDDING_MODEL_ID}" ]; then
-  CMD+=(--embedding_model_id "${EMBEDDING_MODEL_ID}")
-fi
 if supports_flag "--embedding_adapter_ckpt" && [ -n "${EMBEDDING_ADAPTER_CKPT}" ]; then
   CMD+=(--embedding_adapter_ckpt "${EMBEDDING_ADAPTER_CKPT}")
+fi
+if supports_flag "--last_frame_memory" && [ "${LAST_FRAME_MEMORY}" = "1" ]; then
+  CMD+=(--last_frame_memory)
 fi
 if supports_flag "--continuity_candidates"; then
   CMD+=(--continuity_candidates "${CONTINUITY_CANDIDATES}")
 fi
-if supports_flag "--last_frame_memory" && [ "${LAST_FRAME_MEMORY}" = "1" ]; then
-  CMD+=(--last_frame_memory)
+if supports_flag "--continuity_min_score"; then
+  CMD+=(--continuity_min_score "${CONTINUITY_MIN_SCORE}")
+fi
+if supports_flag "--continuity_regen_attempts"; then
+  CMD+=(--continuity_regen_attempts "${CONTINUITY_REGEN_ATTEMPTS}")
+fi
+if supports_flag "--critic_story_weight"; then
+  CMD+=(--critic_story_weight "${CRITIC_STORY_WEIGHT}")
 fi
 if supports_flag "--environment_memory"; then
   if [ "${ENVIRONMENT_MEMORY}" = "1" ]; then
@@ -289,36 +343,87 @@ fi
 if [ -n "${DIRECTOR_MODEL_ID}" ]; then
   CMD+=(--director_model_id "${DIRECTOR_MODEL_ID}")
 fi
+if [ "${DRY_RUN}" = "1" ]; then
+  CMD+=(--dry_run)
+fi
 
 echo "PROJECT_ROOT=${PROJECT_ROOT}"
 echo "OUTPUT_DIR=${OUTPUT_DIR}"
 echo "DEVICE=${DEVICE}"
-echo "DRY_RUN=${DRY_RUN}"
 echo "VIDEO_MODEL_ID=${VIDEO_MODEL_ID}"
-echo "DIRECTOR_MODEL_ID=${DIRECTOR_MODEL_ID}"
+echo "FPS=${FPS}"
+echo "NUM_FRAMES=${NUM_FRAMES}"
+echo "WINDOW_SECONDS=${WINDOW_SECONDS}"
+echo "SEED=${SEED}"
+echo "SEED_STRATEGY=${SEED_STRATEGY}"
 echo "DIRECTOR_TEMPERATURE=${DIRECTOR_TEMPERATURE}"
-echo "PYTHON_BIN=${PYTHON_BIN}"
-echo "DOWNLOAD_MODEL=${DOWNLOAD_MODEL}"
-echo "MODEL_REPO=${MODEL_REPO}"
-echo "MODEL_DIR=${MODEL_DIR}"
-echo "STYLE_PREFIX=${STYLE_PREFIX}"
-echo "CHARACTER_LOCK=${CHARACTER_LOCK}"
-echo "NEGATIVE_PROMPT=${NEGATIVE_PROMPT}"
 echo "EMBEDDING_BACKEND=${EMBEDDING_BACKEND}"
 echo "EMBEDDING_MODEL_ID=${EMBEDDING_MODEL_ID}"
-echo "EMBEDDING_ADAPTER_CKPT=${EMBEDDING_ADAPTER_CKPT}"
 echo "LAST_FRAME_MEMORY=${LAST_FRAME_MEMORY}"
 echo "CONTINUITY_CANDIDATES=${CONTINUITY_CANDIDATES}"
-echo "ENVIRONMENT_MEMORY=${ENVIRONMENT_MEMORY}"
-echo "TRANSITION_WEIGHT=${TRANSITION_WEIGHT}"
-echo "ENVIRONMENT_WEIGHT=${ENVIRONMENT_WEIGHT}"
-echo "SCENE_CHANGE_ENV_DECAY=${SCENE_CHANGE_ENV_DECAY}"
-echo "NUM_FRAMES=${NUM_FRAMES}"
-echo "STEPS=${STEPS}"
-echo "GUIDANCE_SCALE=${GUIDANCE_SCALE}"
-echo "HEIGHT=${HEIGHT}"
-echo "WIDTH=${WIDTH}"
-echo "FPS=${FPS}"
-echo "SEED=${SEED}"
+echo "CONTINUITY_MIN_SCORE=${CONTINUITY_MIN_SCORE}"
+echo "CONTINUITY_REGEN_ATTEMPTS=${CONTINUITY_REGEN_ATTEMPTS}"
+echo "CRITIC_STORY_WEIGHT=${CRITIC_STORY_WEIGHT}"
+echo "EMBEDDING_ADAPTER_CKPT=${EMBEDDING_ADAPTER_CKPT}"
+echo "COMBINE_WINDOWS=${COMBINE_WINDOWS}"
+echo "RUN_REPAIR_PASS=${RUN_REPAIR_PASS}"
+echo "REPAIR_REPLACE_ORIGINAL=${REPAIR_REPLACE_ORIGINAL}"
+echo "REPAIR_CANDIDATES=${REPAIR_CANDIDATES}"
+echo "REPAIR_ATTEMPTS=${REPAIR_ATTEMPTS}"
+echo "REPAIR_ACCEPT_SCORE=${REPAIR_ACCEPT_SCORE}"
+echo "REPAIR_TRANSITION_THRESHOLD=${REPAIR_TRANSITION_THRESHOLD}"
+echo "REPAIR_CRITIC_THRESHOLD=${REPAIR_CRITIC_THRESHOLD}"
+
+bash -n "${BASH_SOURCE[0]}"
 
 "${CMD[@]}"
+
+if [ "${RUN_REPAIR_PASS}" = "1" ]; then
+  REPAIR_CMD=("${PYTHON_BIN}" scripts/08_repair_windows.py
+    --run_dir "${OUTPUT_DIR}"
+    --embedding_backend "${EMBEDDING_BACKEND}"
+    --embedding_model_id "${EMBEDDING_MODEL_ID}"
+    --video_model_id "${VIDEO_MODEL_ID}"
+    --dtype "${DTYPE:-bfloat16}"
+    --device "${DEVICE}"
+    --num_frames "${NUM_FRAMES}"
+    --steps "${STEPS}"
+    --guidance_scale "${GUIDANCE_SCALE}"
+    --height "${HEIGHT}"
+    --width "${WIDTH}"
+    --fps "${FPS}"
+    --candidates "${REPAIR_CANDIDATES}"
+    --attempts "${REPAIR_ATTEMPTS}"
+    --accept_score "${REPAIR_ACCEPT_SCORE}"
+    --transition_threshold "${REPAIR_TRANSITION_THRESHOLD}"
+    --critic_threshold "${REPAIR_CRITIC_THRESHOLD}")
+  if [ "${REPAIR_REPLACE_ORIGINAL}" = "1" ]; then
+    REPAIR_CMD+=(--replace_original)
+  fi
+  "${REPAIR_CMD[@]}"
+fi
+
+# Optional: concatenate generated windows into one video.
+if [ "${COMBINE_WINDOWS}" = "1" ]; then
+  CLIPS_DIR="${OUTPUT_DIR}/clips"
+  COMBINED_VIDEO_PATH="${OUTPUT_DIR}/${COMBINED_VIDEO_NAME}"
+  CONCAT_LIST="${OUTPUT_DIR}/concat_windows.txt"
+
+  if [ -d "${CLIPS_DIR}" ] && compgen -G "${CLIPS_DIR}/window_*.mp4" > /dev/null; then
+    : > "${CONCAT_LIST}"
+    for clip in "${CLIPS_DIR}"/window_*.mp4; do
+      printf "file '%s'\n" "$(realpath "${clip}")" >> "${CONCAT_LIST}"
+    done
+
+    if command -v ffmpeg >/dev/null 2>&1; then
+      if ! ffmpeg -y -f concat -safe 0 -i "${CONCAT_LIST}" -c copy "${COMBINED_VIDEO_PATH}"; then
+        ffmpeg -y -f concat -safe 0 -i "${CONCAT_LIST}" -c:v libx264 -preset veryfast -crf 18 -c:a aac "${COMBINED_VIDEO_PATH}"
+      fi
+      echo "Combined continuity preview: ${COMBINED_VIDEO_PATH}"
+    else
+      echo "ffmpeg not found; skipping combined video creation."
+    fi
+  else
+    echo "No window clips found in ${CLIPS_DIR}; skipping combined video creation."
+  fi
+fi

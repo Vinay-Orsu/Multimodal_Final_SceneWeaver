@@ -13,6 +13,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from director_llm import SceneDirector, SceneDirectorConfig
 from memory_module import NarrativeMemory, VisionEmbedder, VisionEmbedderConfig
+from memory_module.window_critic import evaluate_candidate
 from video_backbone import WanBackbone, WanBackboneConfig
 
 
@@ -34,14 +35,22 @@ def maybe_init_embedder(
 ) -> Optional[VisionEmbedder]:
     if backend == "none":
         return None
-    embedder = VisionEmbedder(
-        VisionEmbedderConfig(
+    # Backward-compatible with older VisionEmbedderConfig versions that
+    # do not expose adapter_ckpt yet.
+    try:
+        cfg = VisionEmbedderConfig(
             backend=backend,
             model_id=model_id,
             adapter_ckpt=adapter_ckpt,
             device=device,
         )
-    )
+    except TypeError:
+        cfg = VisionEmbedderConfig(
+            backend=backend,
+            model_id=model_id,
+            device=device,
+        )
+    embedder = VisionEmbedder(cfg)
     embedder.load()
     return embedder
 
@@ -53,6 +62,8 @@ def build_generation_prompt(
     character_lock: str,
     environment_anchor: str,
     scene_change_requested: bool,
+    story_state_hint: str,
+    repair_hint: str = "",
 ) -> str:
     parts = []
     if style_prefix.strip():
@@ -65,6 +76,8 @@ def build_generation_prompt(
         else:
             parts.append(f"Environment continuity anchor: {environment_anchor.strip()}")
     parts.append(f"Current beat: {beat.strip()}")
+    if story_state_hint.strip():
+        parts.append(f"Story state: {story_state_hint.strip()}")
     parts.append(f"Shot prompt: {refined_prompt.strip()}")
     if scene_change_requested:
         parts.append("Beat suggests a setting change; transition from the previous clip naturally, not abruptly.")
@@ -76,6 +89,8 @@ def build_generation_prompt(
         "Strictly follow the current beat and keep the same characters, identities, and scene context. "
         "No unrelated objects, no random scene changes."
     )
+    if repair_hint.strip():
+        parts.append(f"Critic repair constraints: {repair_hint.strip()}")
     return " ".join(parts)
 
 
@@ -190,6 +205,23 @@ def _combine_continuity_score(
     return float(weighted_sum / total_weight)
 
 
+def _build_story_state_hint(windows: List[Any], pos: int) -> str:
+    previous_beat = windows[pos - 1].beat if pos > 0 else ""
+    current_beat = windows[pos].beat
+    next_beat = windows[pos + 1].beat if pos + 1 < len(windows) else ""
+    future_beat = windows[pos + 2].beat if pos + 2 < len(windows) else ""
+
+    hints: List[str] = []
+    if previous_beat:
+        hints.append(f"Completed previous beat: {previous_beat}.")
+    hints.append(f"Required now: {current_beat}.")
+    if next_beat:
+        hints.append(f"Next beat after this window: {next_beat}.")
+    if future_beat:
+        hints.append(f"Do not jump ahead to later beat yet: {future_beat}.")
+    return " ".join(hints)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Storyline -> Scene Director -> Wan clip windows with local/global memory feedback."
@@ -214,6 +246,13 @@ def main() -> None:
     parser.add_argument("--fps", type=int, default=8)
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument(
+        "--seed_strategy",
+        type=str,
+        default="fixed",
+        choices=["fixed", "window_offset"],
+        help="Seed scheduling across windows. 'fixed' keeps base seed constant for continuity.",
+    )
+    parser.add_argument(
         "--style_prefix",
         type=str,
         default="cinematic realistic, coherent motion, stable camera, high detail",
@@ -223,8 +262,8 @@ def main() -> None:
         "--character_lock",
         type=str,
         default=(
-            "one rabbit and one tortoise only; keep same appearance, size, and colors across all windows; "
-            "no extra animals or humans"
+            "one crow only; keep the same crow appearance, size, and colors across all windows; "
+            "keep one clay pot and small stones consistent; no extra animals or humans"
         ),
         help="Continuity constraints to keep subject identity stable across windows.",
     )
@@ -281,6 +320,24 @@ def main() -> None:
         default=0.25,
         help="Multiplier for environment_weight when beat indicates a location/setting change.",
     )
+    parser.add_argument(
+        "--continuity_min_score",
+        type=float,
+        default=0.72,
+        help="Minimum critic score required to accept a window candidate.",
+    )
+    parser.add_argument(
+        "--continuity_regen_attempts",
+        type=int,
+        default=2,
+        help="Max candidate-generation attempts per window when critic score is below threshold.",
+    )
+    parser.add_argument(
+        "--critic_story_weight",
+        type=float,
+        default=0.15,
+        help="Weight for story progression score in critic final score.",
+    )
     parser.add_argument("--dry_run", action="store_true", help="Only plan/refine prompts. No video generation.")
     args = parser.parse_args()
 
@@ -329,8 +386,9 @@ def main() -> None:
     previous_environment_anchor = ""
     log_rows: List[Dict[str, Any]] = []
 
-    for window in windows:
+    for window_pos, window in enumerate(windows):
         scene_change_requested = _beat_requests_scene_change(window.beat)
+        story_state_hint = _build_story_state_hint(windows, window_pos)
         refined_prompt = director.refine_prompt(
             storyline=args.storyline,
             window=window,
@@ -344,6 +402,8 @@ def main() -> None:
             character_lock=args.character_lock,
             environment_anchor=previous_environment_anchor,
             scene_change_requested=scene_change_requested,
+            story_state_hint=story_state_hint,
+            repair_hint="",
         )
 
         clip_path = clips_dir / f"window_{window.index:03d}.mp4"
@@ -363,7 +423,12 @@ def main() -> None:
         }
 
         if not args.dry_run:
-            base_seed = None if args.seed is None else args.seed + window.index
+            if args.seed is None:
+                base_seed = None
+            elif args.seed_strategy == "window_offset":
+                base_seed = args.seed + window.index
+            else:
+                base_seed = args.seed
             transition_ref_available = (
                 embedder is not None and args.last_frame_memory and previous_last_frame_embedding is not None
             )
@@ -376,98 +441,155 @@ def main() -> None:
                 and (transition_ref_available or environment_ref_available)
             )
             num_candidates = args.continuity_candidates if continuity_active else 1
+            max_attempts = max(1, int(args.continuity_regen_attempts))
             candidate_rows: List[Dict[str, Any]] = []
-            best_frames = None
-            best_seed = base_seed
-            best_transition_similarity = None
-            best_environment_similarity = None
-            best_continuity_score = None
-            best_clip_embedding = None
+            best_overall: Optional[Dict[str, Any]] = None
+            selected: Optional[Dict[str, Any]] = None
 
             transition_weight = max(0.0, float(args.transition_weight))
             environment_weight = max(0.0, float(args.environment_weight))
             if scene_change_requested:
                 scene_change_decay = max(0.0, float(args.scene_change_env_decay))
                 environment_weight *= scene_change_decay
-
-            for candidate_idx in range(num_candidates):
-                candidate_seed = None
-                if base_seed is not None:
-                    candidate_seed = base_seed + (candidate_idx * 100000)
-                candidate_frames = backbone.generate_clip(
-                    prompt=generation_prompt,
-                    negative_prompt=args.negative_prompt,
-                    num_frames=args.num_frames,
-                    num_inference_steps=args.steps,
-                    guidance_scale=args.guidance_scale,
-                    height=args.height,
-                    width=args.width,
-                    seed=candidate_seed,
+            previous_beat = windows[window_pos - 1].beat if window_pos > 0 else ""
+            repair_hint = ""
+            for attempt_idx in range(max_attempts):
+                generation_prompt = build_generation_prompt(
+                    refined_prompt=refined_prompt,
+                    beat=window.beat,
+                    style_prefix=args.style_prefix,
+                    character_lock=args.character_lock,
+                    environment_anchor=previous_environment_anchor,
+                    scene_change_requested=scene_change_requested,
+                    story_state_hint=story_state_hint,
+                    repair_hint=repair_hint,
                 )
 
-                transition_similarity = None
-                if embedder is not None and args.last_frame_memory and previous_last_frame_embedding is not None:
-                    candidate_first_embedding = embedder.embed_first_frame(candidate_frames)
-                    transition_similarity = _cosine_similarity(candidate_first_embedding, previous_last_frame_embedding)
+                best_attempt: Optional[Dict[str, Any]] = None
+                for candidate_idx in range(num_candidates):
+                    candidate_seed = None
+                    if base_seed is not None:
+                        candidate_seed = base_seed + candidate_idx + (attempt_idx * max(32, num_candidates))
+                    candidate_frames = backbone.generate_clip(
+                        prompt=generation_prompt,
+                        negative_prompt=args.negative_prompt,
+                        num_frames=args.num_frames,
+                        num_inference_steps=args.steps,
+                        guidance_scale=args.guidance_scale,
+                        height=args.height,
+                        width=args.width,
+                        seed=candidate_seed,
+                    )
 
-                environment_similarity = None
-                candidate_embedding = None
-                if embedder is not None and args.environment_memory and previous_clip_embedding is not None:
-                    candidate_embedding = embedder.embed_frames(candidate_frames)
-                    environment_similarity = _cosine_similarity(candidate_embedding, previous_clip_embedding)
+                    transition_similarity = None
+                    if embedder is not None and args.last_frame_memory and previous_last_frame_embedding is not None:
+                        candidate_first_embedding = embedder.embed_first_frame(candidate_frames)
+                        transition_similarity = _cosine_similarity(
+                            candidate_first_embedding,
+                            previous_last_frame_embedding,
+                        )
 
-                continuity_score = _combine_continuity_score(
-                    transition_similarity=transition_similarity,
-                    environment_similarity=environment_similarity,
-                    transition_weight=transition_weight,
-                    environment_weight=environment_weight,
-                )
+                    environment_similarity = None
+                    candidate_embedding = None
+                    if embedder is not None and args.environment_memory and previous_clip_embedding is not None:
+                        candidate_embedding = embedder.embed_frames(candidate_frames)
+                        environment_similarity = _cosine_similarity(candidate_embedding, previous_clip_embedding)
 
-                candidate_rows.append(
-                    {
+                    continuity_score = _combine_continuity_score(
+                        transition_similarity=transition_similarity,
+                        environment_similarity=environment_similarity,
+                        transition_weight=transition_weight,
+                        environment_weight=environment_weight,
+                    )
+                    critic = evaluate_candidate(
+                        current_beat=window.beat,
+                        previous_beat=previous_beat,
+                        transition_similarity=transition_similarity,
+                        environment_similarity=environment_similarity,
+                        continuity_score=continuity_score,
+                        story_weight=float(args.critic_story_weight),
+                        continuity_weight=max(0.0, 1.0 - float(args.critic_story_weight)),
+                        attempt_index=attempt_idx,
+                    )
+
+                    candidate_entry = {
+                        "attempt_index": attempt_idx,
                         "candidate_index": candidate_idx,
                         "seed": candidate_seed,
                         "transition_similarity": transition_similarity,
                         "environment_similarity": environment_similarity,
                         "continuity_score": continuity_score,
+                        "critic_score": critic.final_score,
+                        "critic_story_progress_score": critic.story_progress_score,
+                        "critic_feedback": critic.feedback,
                     }
+                    candidate_rows.append(candidate_entry)
+
+                    candidate_state = {
+                        "frames": candidate_frames,
+                        "seed": candidate_seed,
+                        "transition_similarity": transition_similarity,
+                        "environment_similarity": environment_similarity,
+                        "continuity_score": continuity_score,
+                        "clip_embedding": candidate_embedding,
+                        "critic_score": critic.final_score,
+                        "critic_feedback": critic.feedback,
+                        "generation_prompt": generation_prompt,
+                        "attempt_index": attempt_idx,
+                        "candidate_index": candidate_idx,
+                    }
+                    if best_attempt is None or candidate_state["critic_score"] > best_attempt["critic_score"]:
+                        best_attempt = candidate_state
+
+                if best_attempt is None:
+                    continue
+                if best_overall is None or best_attempt["critic_score"] > best_overall["critic_score"]:
+                    best_overall = best_attempt
+                if best_attempt["critic_score"] >= float(args.continuity_min_score):
+                    selected = best_attempt
+                    break
+                repair_hint = best_attempt["critic_feedback"]
+                refined_prompt = director.refine_prompt(
+                    storyline=args.storyline,
+                    window=window,
+                    previous_prompt=previous_prompt,
+                    memory_feedback={
+                        "suggested_constraints": repair_hint,
+                    },
                 )
 
-                if best_frames is None:
-                    best_frames = candidate_frames
-                    best_seed = candidate_seed
-                    best_transition_similarity = transition_similarity
-                    best_environment_similarity = environment_similarity
-                    best_continuity_score = continuity_score
-                    best_clip_embedding = candidate_embedding
-                elif continuity_score is not None and (
-                    best_continuity_score is None or continuity_score > best_continuity_score
-                ):
-                    best_frames = candidate_frames
-                    best_seed = candidate_seed
-                    best_transition_similarity = transition_similarity
-                    best_environment_similarity = environment_similarity
-                    best_continuity_score = continuity_score
-                    best_clip_embedding = candidate_embedding
+            selected = selected or best_overall
+            if selected is None:
+                raise RuntimeError(f"No candidate generated for window {window.index}")
 
-            frames = best_frames
-            window_seed = best_seed
+            frames = selected["frames"]
+            window_seed = selected["seed"]
             backbone.save_video(frames=frames, output_path=clip_path.as_posix(), fps=args.fps)
             row["generated"] = True
             row["seed"] = window_seed
             row["continuity_candidates"] = num_candidates
-            row["selected_transition_similarity"] = best_transition_similarity
-            row["selected_environment_similarity"] = best_environment_similarity
-            row["selected_continuity_score"] = best_continuity_score
+            row["selected_transition_similarity"] = selected["transition_similarity"]
+            row["selected_environment_similarity"] = selected["environment_similarity"]
+            row["selected_continuity_score"] = selected["continuity_score"]
+            row["selected_critic_score"] = selected["critic_score"]
+            row["selected_critic_feedback"] = selected["critic_feedback"]
+            row["generation_prompt"] = selected["generation_prompt"]
+            row["selected_attempt_index"] = selected["attempt_index"]
+            row["continuity_min_score"] = args.continuity_min_score
+            row["continuity_regen_attempts"] = max_attempts
             if len(candidate_rows) > 1:
                 row["candidate_scores"] = candidate_rows
 
             if embedder is not None and memory is not None:
+                best_clip_embedding = selected["clip_embedding"]
                 embedding = best_clip_embedding if best_clip_embedding is not None else embedder.embed_frames(frames)
                 memory_feedback = memory.register_window(
                     window.index,
                     embedding,
-                    transition_similarity=best_transition_similarity,
+                    transition_similarity=selected["transition_similarity"],
+                )
+                memory_feedback.suggested_constraints = (
+                    f"{memory_feedback.suggested_constraints} {selected['critic_feedback']}".strip()
                 )
                 row["memory_feedback"] = memory_feedback.to_dict()
                 if args.last_frame_memory:
@@ -499,6 +621,11 @@ def main() -> None:
         "transition_weight": args.transition_weight,
         "environment_weight": args.environment_weight,
         "scene_change_env_decay": args.scene_change_env_decay,
+        "seed": args.seed,
+        "seed_strategy": args.seed_strategy,
+        "continuity_min_score": args.continuity_min_score,
+        "continuity_regen_attempts": args.continuity_regen_attempts,
+        "critic_story_weight": args.critic_story_weight,
         "output_dir": out_dir.as_posix(),
         "run_log": (out_dir / "run_log.jsonl").as_posix(),
     }

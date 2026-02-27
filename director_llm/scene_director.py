@@ -21,6 +21,7 @@ class SceneDirectorConfig:
     model_id: Optional[str] = None
     temperature: float = 0.7
     max_new_tokens: int = 512
+    do_sample: bool = False
 
 
 class SceneDirector:
@@ -98,20 +99,25 @@ class SceneDirector:
             "2) Advance only the current beat.\n"
             "3) Avoid adding new random characters or objects.\n"
             "4) Keep camera and motion explicit and realistic.\n"
-            "Return JSON only: {\"prompt\": \"...\"}\n"
+            "5) Use concrete visual language, not abstract prose.\n"
+            "Return JSON only with keys:\n"
+            "{\"shot_type\":\"...\",\"camera_angle\":\"...\",\"camera_motion\":\"...\","
+            "\"subject_blocking\":\"...\",\"action\":\"...\",\"continuity_anchor\":\"...\"}\n"
             f"Context:\n{json.dumps(context, ensure_ascii=False)}\n"
         )
 
-        out = self._generator(
-            prompt,
-            max_new_tokens=self.config.max_new_tokens,
-            temperature=self.config.temperature,
-            do_sample=True,
-        )[0]["generated_text"]
+        gen_kwargs: Dict[str, Any] = {
+            "max_new_tokens": self.config.max_new_tokens,
+            "do_sample": self.config.do_sample,
+        }
+        if self.config.do_sample:
+            gen_kwargs["temperature"] = self.config.temperature
+        out = self._generator(prompt, **gen_kwargs)[0]["generated_text"]
 
         parsed = self._extract_json_object(out)
-        if parsed and isinstance(parsed.get("prompt"), str):
-            cleaned = self._normalize_prompt(parsed["prompt"])
+        if parsed:
+            structured = self._compose_structured_prompt(parsed, window)
+            cleaned = self._normalize_prompt(structured)
             if cleaned:
                 return cleaned
         return self._heuristic_refine_prompt(window, previous_prompt, memory_feedback)
@@ -180,11 +186,46 @@ class SceneDirector:
             compact_prev = previous_prompt.split(" Previous visual context:")[0].strip()
             compact_prev = compact_prev[:240]
             previous_context = f" Previous visual context: {compact_prev}"
+        shot_type, camera_angle, camera_motion = SceneDirector._default_shot_plan(window.index)
         base = (
-            f"{window.prompt_seed}. Time window {window.start_sec}-{window.end_sec}s, "
+            f"{window.prompt_seed}. Shot type: {shot_type}. Camera angle: {camera_angle}. "
+            f"Camera motion: {camera_motion}. Time window {window.start_sec}-{window.end_sec}s, "
             f"{continuity}.{previous_context}"
         )
         return SceneDirector._normalize_prompt(base)
+
+    @staticmethod
+    def _default_shot_plan(index: int) -> tuple[str, str, str]:
+        plans = [
+            ("wide establishing", "eye-level", "slow dolly-in"),
+            ("medium two-shot", "eye-level", "gentle tracking"),
+            ("close-up action", "slightly low", "subtle handheld"),
+            ("medium profile", "eye-level", "locked-off"),
+        ]
+        return plans[index % len(plans)]
+
+    @staticmethod
+    def _compose_structured_prompt(parsed: Dict[str, Any], window: SceneWindow) -> str:
+        def _field(name: str, fallback: str) -> str:
+            value = parsed.get(name)
+            if isinstance(value, str):
+                cleaned = " ".join(value.split()).strip()
+                if cleaned:
+                    return cleaned
+            return fallback
+
+        shot_type, camera_angle, camera_motion = SceneDirector._default_shot_plan(window.index)
+        shot_type = _field("shot_type", shot_type)
+        camera_angle = _field("camera_angle", camera_angle)
+        camera_motion = _field("camera_motion", camera_motion)
+        subject_blocking = _field("subject_blocking", "keep main subjects centered and consistent")
+        action = _field("action", window.beat)
+        continuity_anchor = _field("continuity_anchor", "preserve previous location layout and lighting")
+        return (
+            f"Shot type: {shot_type}. Camera angle: {camera_angle}. Camera motion: {camera_motion}. "
+            f"Subject blocking: {subject_blocking}. Action: {action}. "
+            f"Continuity anchor: {continuity_anchor}."
+        )
 
     @staticmethod
     def _normalize_prompt(text: str) -> str:

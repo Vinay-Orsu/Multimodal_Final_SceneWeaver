@@ -128,6 +128,19 @@ NEG_EOF
 )"
 fi
 
+# Track which knobs were explicitly provided by user/environment so presets
+# only override unset values.
+HAS_FPS="${FPS+x}"
+HAS_NUM_FRAMES="${NUM_FRAMES+x}"
+HAS_STEPS="${STEPS+x}"
+HAS_CONTINUITY_CANDIDATES="${CONTINUITY_CANDIDATES+x}"
+HAS_CONTINUITY_REGEN_ATTEMPTS="${CONTINUITY_REGEN_ATTEMPTS+x}"
+HAS_CONTINUITY_MIN_SCORE="${CONTINUITY_MIN_SCORE+x}"
+HAS_RUN_REPAIR_PASS="${RUN_REPAIR_PASS+x}"
+HAS_REPAIR_CANDIDATES="${REPAIR_CANDIDATES+x}"
+HAS_REPAIR_ATTEMPTS="${REPAIR_ATTEMPTS+x}"
+HAS_PARALLEL_WINDOW_MODE="${PARALLEL_WINDOW_MODE+x}"
+
 TOTAL_MINUTES="${TOTAL_MINUTES:-1}"
 FPS="${FPS:-12}"
 WINDOW_SECONDS="${WINDOW_SECONDS:-8}"
@@ -172,6 +185,29 @@ REPAIR_ATTEMPTS="${REPAIR_ATTEMPTS:-3}"
 REPAIR_ACCEPT_SCORE="${REPAIR_ACCEPT_SCORE:-0.86}"
 REPAIR_TRANSITION_THRESHOLD="${REPAIR_TRANSITION_THRESHOLD:-0.84}"
 REPAIR_CRITIC_THRESHOLD="${REPAIR_CRITIC_THRESHOLD:-0.82}"
+RUN_PRESET="${RUN_PRESET:-quality}"   # quality|fast
+WINDOW_SHARD_COUNT="${WINDOW_SHARD_COUNT:-1}"
+WINDOW_SHARD_INDEX="${WINDOW_SHARD_INDEX:-0}"
+PARALLEL_WINDOW_MODE="${PARALLEL_WINDOW_MODE:-0}"
+PARALLEL_GPUS_PER_NODE="${PARALLEL_GPUS_PER_NODE:-0}"
+
+if [ "${RUN_PRESET}" = "fast" ]; then
+  [ -z "${HAS_FPS}" ] && FPS="8"
+  [ -z "${HAS_NUM_FRAMES}" ] && NUM_FRAMES="64"
+  [ -z "${HAS_STEPS}" ] && STEPS="16"
+  [ -z "${HAS_CONTINUITY_CANDIDATES}" ] && CONTINUITY_CANDIDATES="2"
+  [ -z "${HAS_CONTINUITY_REGEN_ATTEMPTS}" ] && CONTINUITY_REGEN_ATTEMPTS="1"
+  [ -z "${HAS_CONTINUITY_MIN_SCORE}" ] && CONTINUITY_MIN_SCORE="0.72"
+  [ -z "${HAS_RUN_REPAIR_PASS}" ] && RUN_REPAIR_PASS="0"
+  [ -z "${HAS_REPAIR_CANDIDATES}" ] && REPAIR_CANDIDATES="2"
+  [ -z "${HAS_REPAIR_ATTEMPTS}" ] && REPAIR_ATTEMPTS="1"
+  [ -z "${HAS_PARALLEL_WINDOW_MODE}" ] && PARALLEL_WINDOW_MODE="1"
+fi
+
+# Auto-bind shard index for SLURM array jobs when not explicitly set.
+if [ "${WINDOW_SHARD_COUNT}" -gt 1 ] && [ "${WINDOW_SHARD_INDEX}" = "0" ] && [ -n "${SLURM_ARRAY_TASK_ID:-}" ]; then
+  WINDOW_SHARD_INDEX="${SLURM_ARRAY_TASK_ID}"
+fi
 
 # Select model id
 if [ -n "${WAN_LOCAL_MODEL}" ]; then
@@ -340,6 +376,19 @@ fi
 if supports_flag "--scene_change_env_decay"; then
   CMD+=(--scene_change_env_decay "${SCENE_CHANGE_ENV_DECAY}")
 fi
+if supports_flag "--window_shard_count"; then
+  CMD+=(--window_shard_count "${WINDOW_SHARD_COUNT}")
+fi
+if supports_flag "--window_shard_index"; then
+  CMD+=(--window_shard_index "${WINDOW_SHARD_INDEX}")
+fi
+if supports_flag "--parallel_window_mode"; then
+  if [ "${PARALLEL_WINDOW_MODE}" = "1" ]; then
+    CMD+=(--parallel_window_mode)
+  else
+    CMD+=(--no-parallel_window_mode)
+  fi
+fi
 if [ -n "${DIRECTOR_MODEL_ID}" ]; then
   CMD+=(--director_model_id "${DIRECTOR_MODEL_ID}")
 fi
@@ -365,6 +414,11 @@ echo "CONTINUITY_MIN_SCORE=${CONTINUITY_MIN_SCORE}"
 echo "CONTINUITY_REGEN_ATTEMPTS=${CONTINUITY_REGEN_ATTEMPTS}"
 echo "CRITIC_STORY_WEIGHT=${CRITIC_STORY_WEIGHT}"
 echo "EMBEDDING_ADAPTER_CKPT=${EMBEDDING_ADAPTER_CKPT}"
+echo "RUN_PRESET=${RUN_PRESET}"
+echo "WINDOW_SHARD_COUNT=${WINDOW_SHARD_COUNT}"
+echo "WINDOW_SHARD_INDEX=${WINDOW_SHARD_INDEX}"
+echo "PARALLEL_WINDOW_MODE=${PARALLEL_WINDOW_MODE}"
+echo "PARALLEL_GPUS_PER_NODE=${PARALLEL_GPUS_PER_NODE}"
 echo "COMBINE_WINDOWS=${COMBINE_WINDOWS}"
 echo "RUN_REPAIR_PASS=${RUN_REPAIR_PASS}"
 echo "REPAIR_REPLACE_ORIGINAL=${REPAIR_REPLACE_ORIGINAL}"
@@ -376,9 +430,37 @@ echo "REPAIR_CRITIC_THRESHOLD=${REPAIR_CRITIC_THRESHOLD}"
 
 bash -n "${BASH_SOURCE[0]}"
 
-"${CMD[@]}"
+if [ "${PARALLEL_GPUS_PER_NODE}" -gt 1 ]; then
+  BASE_SHARDS="${WINDOW_SHARD_COUNT}"
+  BASE_INDEX="${WINDOW_SHARD_INDEX}"
+  if [ "${BASE_SHARDS}" -le 1 ]; then
+    BASE_SHARDS="${PARALLEL_GPUS_PER_NODE}"
+    BASE_INDEX=0
+  fi
+  pids=()
+  for local_gpu in $(seq 0 $((PARALLEL_GPUS_PER_NODE - 1))); do
+    global_shard_index=$((BASE_INDEX * PARALLEL_GPUS_PER_NODE + local_gpu))
+    global_shard_count=$((BASE_SHARDS * PARALLEL_GPUS_PER_NODE))
+    SUB_CMD=("${CMD[@]}" --window_shard_count "${global_shard_count}" --window_shard_index "${global_shard_index}")
+    echo "[parallel] launch gpu=${local_gpu} shard=${global_shard_index}/${global_shard_count}"
+    CUDA_VISIBLE_DEVICES="${local_gpu}" "${SUB_CMD[@]}" &
+    pids+=("$!")
+  done
+  rc=0
+  for pid in "${pids[@]}"; do
+    if ! wait "${pid}"; then
+      rc=1
+    fi
+  done
+  if [ "${rc}" -ne 0 ]; then
+    echo "One or more parallel shard workers failed."
+    exit "${rc}"
+  fi
+else
+  "${CMD[@]}"
+fi
 
-if [ "${RUN_REPAIR_PASS}" = "1" ]; then
+if [ "${RUN_REPAIR_PASS}" = "1" ] && [ "${WINDOW_SHARD_COUNT}" = "1" ] && [ "${PARALLEL_GPUS_PER_NODE}" = "0" ]; then
   REPAIR_CMD=("${PYTHON_BIN}" scripts/08_repair_windows.py
     --run_dir "${OUTPUT_DIR}"
     --embedding_backend "${EMBEDDING_BACKEND}"
@@ -404,7 +486,7 @@ if [ "${RUN_REPAIR_PASS}" = "1" ]; then
 fi
 
 # Optional: concatenate generated windows into one video.
-if [ "${COMBINE_WINDOWS}" = "1" ]; then
+if [ "${COMBINE_WINDOWS}" = "1" ] && [ "${WINDOW_SHARD_COUNT}" = "1" ] && [ "${PARALLEL_GPUS_PER_NODE}" = "0" ]; then
   CLIPS_DIR="${OUTPUT_DIR}/clips"
   COMBINED_VIDEO_PATH="${OUTPUT_DIR}/${COMBINED_VIDEO_NAME}"
   CONCAT_LIST="${OUTPUT_DIR}/concat_windows.txt"

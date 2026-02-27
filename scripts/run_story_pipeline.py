@@ -339,7 +339,33 @@ def main() -> None:
         help="Weight for story progression score in critic final score.",
     )
     parser.add_argument("--dry_run", action="store_true", help="Only plan/refine prompts. No video generation.")
+    parser.add_argument(
+        "--window_shard_count",
+        type=int,
+        default=1,
+        help="Total number of independent window shards. >1 enables sharded generation.",
+    )
+    parser.add_argument(
+        "--window_shard_index",
+        type=int,
+        default=0,
+        help="Zero-based shard index in [0, window_shard_count).",
+    )
+    parser.add_argument(
+        "--parallel_window_mode",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "When enabled, windows are generated independently (no cross-window memory chaining). "
+            "Use for multi-GPU/multi-node speed runs."
+        ),
+    )
     args = parser.parse_args()
+
+    if args.window_shard_count < 1:
+        raise ValueError("--window_shard_count must be >= 1")
+    if args.window_shard_index < 0 or args.window_shard_index >= args.window_shard_count:
+        raise ValueError("--window_shard_index must satisfy 0 <= index < window_shard_count")
 
     out_dir = Path(args.output_dir)
     clips_dir = out_dir / "clips"
@@ -386,7 +412,25 @@ def main() -> None:
     previous_environment_anchor = ""
     log_rows: List[Dict[str, Any]] = []
 
-    for window_pos, window in enumerate(windows):
+    selected_windows = [
+        (window_pos, window)
+        for window_pos, window in enumerate(windows)
+        if (window.index % args.window_shard_count) == args.window_shard_index
+    ]
+
+    print(
+        f"[shard] index={args.window_shard_index}/{args.window_shard_count} "
+        f"selected_windows={len(selected_windows)} total_windows={len(windows)} "
+        f"parallel_window_mode={args.parallel_window_mode}"
+    )
+
+    for window_pos, window in selected_windows:
+        if args.parallel_window_mode:
+            previous_prompt = ""
+            memory_feedback = None
+            previous_last_frame_embedding = None
+            previous_clip_embedding = None
+            previous_environment_anchor = ""
         scene_change_requested = _beat_requests_scene_change(window.beat)
         story_state_hint = _build_story_state_hint(windows, window_pos)
         refined_prompt = director.refine_prompt(
@@ -451,7 +495,10 @@ def main() -> None:
             if scene_change_requested:
                 scene_change_decay = max(0.0, float(args.scene_change_env_decay))
                 environment_weight *= scene_change_decay
-            previous_beat = windows[window_pos - 1].beat if window_pos > 0 else ""
+            if args.parallel_window_mode:
+                previous_beat = ""
+            else:
+                previous_beat = windows[window_pos - 1].beat if window_pos > 0 else ""
             repair_hint = ""
             for attempt_idx in range(max_attempts):
                 generation_prompt = build_generation_prompt(
@@ -597,14 +644,23 @@ def main() -> None:
                 if args.environment_memory:
                     previous_clip_embedding = embedding
 
-        previous_prompt = _compact_previous_prompt(refined_prompt)
-        next_environment_anchor = _extract_environment_anchor(refined_prompt)
-        if next_environment_anchor:
-            previous_environment_anchor = next_environment_anchor
+        if not args.parallel_window_mode:
+            previous_prompt = _compact_previous_prompt(refined_prompt)
+            next_environment_anchor = _extract_environment_anchor(refined_prompt)
+            if next_environment_anchor:
+                previous_environment_anchor = next_environment_anchor
         log_rows.append(row)
         print(f"[scene {window.index:03d}] {window.start_sec}-{window.end_sec}s ready")
 
-    export_jsonl(log_rows, out_dir / "run_log.jsonl")
+    if args.window_shard_count > 1:
+        shard_tag = f"shard_{args.window_shard_index:03d}_of_{args.window_shard_count:03d}"
+        log_path = out_dir / f"run_log.{shard_tag}.jsonl"
+        summary_path = out_dir / f"run_summary.{shard_tag}.json"
+    else:
+        log_path = out_dir / "run_log.jsonl"
+        summary_path = out_dir / "run_summary.json"
+
+    export_jsonl(log_rows, log_path)
     summary = {
         "storyline": args.storyline,
         "total_minutes": args.total_minutes,
@@ -626,14 +682,18 @@ def main() -> None:
         "continuity_min_score": args.continuity_min_score,
         "continuity_regen_attempts": args.continuity_regen_attempts,
         "critic_story_weight": args.critic_story_weight,
+        "window_shard_count": args.window_shard_count,
+        "window_shard_index": args.window_shard_index,
+        "parallel_window_mode": args.parallel_window_mode,
+        "selected_windows": len(selected_windows),
         "output_dir": out_dir.as_posix(),
-        "run_log": (out_dir / "run_log.jsonl").as_posix(),
+        "run_log": log_path.as_posix(),
     }
-    with (out_dir / "run_summary.json").open("w", encoding="utf-8") as f:
+    with summary_path.open("w", encoding="utf-8") as f:
         json.dump(summary, f, ensure_ascii=False, indent=2)
 
     print(f"[done] windows: {len(windows)}")
-    print(f"[done] logs: {(out_dir / 'run_log.jsonl').as_posix()}")
+    print(f"[done] logs: {log_path.as_posix()}")
 
 
 if __name__ == "__main__":

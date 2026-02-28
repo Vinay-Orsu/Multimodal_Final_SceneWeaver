@@ -13,6 +13,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from director_llm import SceneDirector, SceneDirectorConfig
 from memory_module import NarrativeMemory, VisionEmbedder, VisionEmbedderConfig
+from memory_module.captioner import Captioner, CaptionerConfig
 from memory_module.window_critic import evaluate_candidate
 from video_backbone import WanBackbone, WanBackboneConfig
 
@@ -360,6 +361,25 @@ def main() -> None:
             "Use for multi-GPU/multi-node speed runs."
         ),
     )
+    parser.add_argument(
+        "--captioner_model_id",
+        type=str,
+        default="",
+        help="Optional captioner model id (e.g., Salesforce/blip2-flan-t5-xl). Leave blank to disable.",
+    )
+    parser.add_argument(
+        "--captioner_device",
+        type=str,
+        default="cpu",
+        choices=["auto", "cuda", "mps", "cpu"],
+        help="Device for captioner; default cpu to avoid GPU contention.",
+    )
+    parser.add_argument(
+        "--captioner_stub_fallback",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="If captioner model fails to load, fall back to stub captions instead of crashing.",
+    )
     args = parser.parse_args()
 
     if args.window_shard_count < 1:
@@ -396,6 +416,7 @@ def main() -> None:
 
     embedder = None
     memory = None
+    captioner = None
     if args.embedding_backend != "none":
         embedder = maybe_init_embedder(
             backend=args.embedding_backend,
@@ -404,12 +425,22 @@ def main() -> None:
             device=args.device,
         )
         memory = NarrativeMemory()
+    if args.captioner_model_id:
+        captioner = Captioner(
+            CaptionerConfig(
+                model_id=args.captioner_model_id,
+                device=args.captioner_device,
+                stub_fallback=bool(args.captioner_stub_fallback),
+            )
+        )
+        captioner.load()
 
     previous_prompt = ""
     memory_feedback = None
     previous_last_frame_embedding = None
     previous_clip_embedding = None
     previous_environment_anchor = ""
+    next_negative_prompt = args.negative_prompt
     log_rows: List[Dict[str, Any]] = []
 
     selected_windows = [
@@ -431,6 +462,7 @@ def main() -> None:
             previous_last_frame_embedding = None
             previous_clip_embedding = None
             previous_environment_anchor = ""
+            next_negative_prompt = args.negative_prompt
         scene_change_requested = _beat_requests_scene_change(window.beat)
         story_state_hint = _build_story_state_hint(windows, window_pos)
         refined_prompt = director.refine_prompt(
@@ -460,7 +492,7 @@ def main() -> None:
             "generation_prompt": generation_prompt,
             "scene_change_requested": scene_change_requested,
             "environment_anchor": previous_environment_anchor,
-            "negative_prompt": args.negative_prompt,
+            "negative_prompt": next_negative_prompt,
             "clip_path": clip_path.as_posix(),
             "generated": False,
             "memory_feedback": None,
@@ -519,7 +551,7 @@ def main() -> None:
                         candidate_seed = base_seed + candidate_idx + (attempt_idx * max(32, num_candidates))
                     candidate_frames = backbone.generate_clip(
                         prompt=generation_prompt,
-                        negative_prompt=args.negative_prompt,
+                        negative_prompt=next_negative_prompt,
                         num_frames=args.num_frames,
                         num_inference_steps=args.steps,
                         guidance_scale=args.guidance_scale,
@@ -627,6 +659,12 @@ def main() -> None:
             if len(candidate_rows) > 1:
                 row["candidate_scores"] = candidate_rows
 
+            if captioner is not None:
+                captions, caption_summary, caption_dupes = captioner.caption_frames(frames)
+                row["captions"] = captions
+                row["caption_summary"] = caption_summary
+                row["caption_duplicates"] = caption_dupes
+
             if embedder is not None and memory is not None:
                 best_clip_embedding = selected["clip_embedding"]
                 embedding = best_clip_embedding if best_clip_embedding is not None else embedder.embed_frames(frames)
@@ -646,9 +684,19 @@ def main() -> None:
 
         if not args.parallel_window_mode:
             previous_prompt = _compact_previous_prompt(refined_prompt)
-            next_environment_anchor = _extract_environment_anchor(refined_prompt)
+            next_environment_anchor = ""
+            if captioner is not None and row.get("caption_summary"):
+                next_environment_anchor = row["caption_summary"]
+            if not next_environment_anchor:
+                next_environment_anchor = _extract_environment_anchor(refined_prompt)
             if next_environment_anchor:
                 previous_environment_anchor = next_environment_anchor
+            if row.get("caption_duplicates"):
+                next_negative_prompt = (
+                    f"{args.negative_prompt}, two crows, duplicate bird, multiple birds, another crow"
+                )
+            else:
+                next_negative_prompt = args.negative_prompt
         log_rows.append(row)
         print(f"[scene {window.index:03d}] {window.start_sec}-{window.end_sec}s ready")
 
@@ -688,6 +736,7 @@ def main() -> None:
         "selected_windows": len(selected_windows),
         "output_dir": out_dir.as_posix(),
         "run_log": log_path.as_posix(),
+        "captioner_model_id": args.captioner_model_id or None,
     }
     with summary_path.open("w", encoding="utf-8") as f:
         json.dump(summary, f, ensure_ascii=False, indent=2)

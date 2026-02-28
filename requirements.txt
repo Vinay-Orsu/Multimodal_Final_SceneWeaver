@@ -8,3 +8,7 @@ imageio-ffmpeg>=0.5
 diffusers>=0.30
 accelerate>=0.30
 ftfy>=6.2
+huggingface_hub[cli]>=0.24
+# Captioner deps (BLIP-2 / LLaVA)
+timm>=0.9.12
+sentencepiece>=0.1.99

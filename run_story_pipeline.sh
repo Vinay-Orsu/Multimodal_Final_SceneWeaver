@@ -128,6 +128,10 @@ NEG_EOF
 )"
 fi
 
+CAPTIONER_MODEL_ID="${CAPTIONER_MODEL_ID:-}"
+CAPTIONER_DEVICE="${CAPTIONER_DEVICE:-cpu}"
+CAPTIONER_STUB_FALLBACK="${CAPTIONER_STUB_FALLBACK:-1}"
+
 # Track which knobs were explicitly provided by user/environment so presets
 # only override unset values.
 HAS_FPS="${FPS+x}"
@@ -389,6 +393,13 @@ if supports_flag "--parallel_window_mode"; then
     CMD+=(--no-parallel_window_mode)
   fi
 fi
+if supports_flag "--captioner_model_id" && [ -n "${CAPTIONER_MODEL_ID}" ]; then
+  CMD+=(--captioner_model_id "${CAPTIONER_MODEL_ID}")
+  CMD+=(--captioner_device "${CAPTIONER_DEVICE}")
+  if [ "${CAPTIONER_STUB_FALLBACK}" = "0" ]; then
+    CMD+=(--no-captioner_stub_fallback)
+  fi
+fi
 if [ -n "${DIRECTOR_MODEL_ID}" ]; then
   CMD+=(--director_model_id "${DIRECTOR_MODEL_ID}")
 fi
@@ -427,6 +438,8 @@ echo "REPAIR_ATTEMPTS=${REPAIR_ATTEMPTS}"
 echo "REPAIR_ACCEPT_SCORE=${REPAIR_ACCEPT_SCORE}"
 echo "REPAIR_TRANSITION_THRESHOLD=${REPAIR_TRANSITION_THRESHOLD}"
 echo "REPAIR_CRITIC_THRESHOLD=${REPAIR_CRITIC_THRESHOLD}"
+echo "CAPTIONER_MODEL_ID=${CAPTIONER_MODEL_ID}"
+echo "CAPTIONER_DEVICE=${CAPTIONER_DEVICE}"
 
 bash -n "${BASH_SOURCE[0]}"
 
@@ -479,6 +492,12 @@ if [ "${RUN_REPAIR_PASS}" = "1" ] && [ "${WINDOW_SHARD_COUNT}" = "1" ] && [ "${P
     --accept_score "${REPAIR_ACCEPT_SCORE}"
     --transition_threshold "${REPAIR_TRANSITION_THRESHOLD}"
     --critic_threshold "${REPAIR_CRITIC_THRESHOLD}")
+  if [ -n "${CAPTIONER_MODEL_ID}" ]; then
+    REPAIR_CMD+=(--captioner_model_id "${CAPTIONER_MODEL_ID}" --captioner_device "${CAPTIONER_DEVICE}")
+    if [ "${CAPTIONER_STUB_FALLBACK}" = "0" ]; then
+      REPAIR_CMD+=(--captioner_stub_fallback 0)
+    fi
+  fi
   if [ "${REPAIR_REPLACE_ORIGINAL}" = "1" ]; then
     REPAIR_CMD+=(--replace_original)
   fi

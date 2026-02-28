@@ -10,6 +10,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from memory_module import VisionEmbedder, VisionEmbedderConfig
+from memory_module.captioner import Captioner, CaptionerConfig
 from video_backbone import WanBackbone, WanBackboneConfig
 
 
@@ -51,6 +52,17 @@ def _mean(values: List[Optional[float]]) -> Optional[float]:
     if not vals:
         return None
     return float(sum(vals) / len(vals))
+
+
+def _token_set(text: str) -> set:
+    return {w for w in re.findall(r"[a-z0-9]+", (text or "").lower()) if len(w) > 2}
+
+
+def _overlap(a: str, b: str) -> float:
+    ta, tb = _token_set(a), _token_set(b)
+    if not ta or not tb:
+        return 0.0
+    return len(ta & tb) / len(ta | tb)
 
 
 def _resolve_clip_path(run_dir: Path, row: Dict[str, Any]) -> Path:
@@ -131,6 +143,20 @@ def main() -> None:
     parser.add_argument("--transition_threshold", type=float, default=0.82)
     parser.add_argument("--max_repairs", type=int, default=0, help="0 means repair all weak windows.")
     parser.add_argument("--replace_original", action="store_true", help="Overwrite original clips with repaired clips.")
+    parser.add_argument("--captioner_model_id", type=str, default="", help="Optional captioner model id for semantic checks.")
+    parser.add_argument(
+        "--captioner_device",
+        type=str,
+        default="cpu",
+        choices=["auto", "cuda", "mps", "cpu"],
+        help="Device for captioner; default cpu to avoid GPU contention.",
+    )
+    parser.add_argument(
+        "--captioner_stub_fallback",
+        action="store_true",
+        default=True,
+        help="Fallback to stub captions when model cannot load.",
+    )
     args = parser.parse_args()
 
     run_dir = Path(args.run_dir)
@@ -174,6 +200,17 @@ def main() -> None:
         )
     )
     backbone.load()
+
+    captioner = None
+    if args.captioner_model_id:
+        captioner = Captioner(
+            CaptionerConfig(
+                model_id=args.captioner_model_id,
+                device=args.captioner_device,
+                stub_fallback=bool(args.captioner_stub_fallback),
+            )
+        )
+        captioner.load()
 
     clips_dir = run_dir / "clips"
     repaired_dir = run_dir / "clips_repaired"
@@ -264,6 +301,26 @@ def main() -> None:
                 final = _mean([boundary, boundary, env])  # boundary gets higher weight
                 final_score = float(final) if final is not None else 0.0
 
+                caption_summary = None
+                caption_penalty = 0.0
+                caption_dupes = False
+                caption_overlap = None
+                if captioner is not None:
+                    captions, caption_summary, caption_dupes = captioner.caption_frames(frames)
+                    prev_caption = rows[prev_idx].get("caption_summary", "") if prev_idx >= 0 and prev_idx < len(rows) else ""
+                    next_caption = rows[next_idx].get("caption_summary", "") if next_idx < len(rows) else ""
+                    overlaps = []
+                    if caption_summary and prev_caption:
+                        overlaps.append(_overlap(caption_summary, prev_caption))
+                    if caption_summary and next_caption:
+                        overlaps.append(_overlap(caption_summary, next_caption))
+                    caption_overlap = _mean(overlaps)
+                    if caption_overlap is not None and caption_overlap < 0.20:
+                        caption_penalty += 0.15
+                    if caption_dupes:
+                        caption_penalty += 0.10
+                    final_score = max(0.0, final_score - caption_penalty)
+
                 feedback_parts: List[str] = []
                 if left_transition is not None and left_transition < args.transition_threshold:
                     feedback_parts.append("Opening frame must match previous window ending composition.")
@@ -271,6 +328,8 @@ def main() -> None:
                     feedback_parts.append("Ending frame must flow into next window opening composition.")
                 if env is not None and env < args.critic_threshold:
                     feedback_parts.append("Preserve fixed courtyard layout, pot position, and object continuity.")
+                if caption_penalty > 0:
+                    feedback_parts.append("Caption alignment with neighbors is weak or shows duplicates.")
                 if not feedback_parts:
                     feedback_parts.append("Continuity objective satisfied.")
                 feedback = " ".join(feedback_parts)
@@ -289,6 +348,9 @@ def main() -> None:
                     "clip_embedding": cand_clip,
                     "first_embedding": cand_first,
                     "last_embedding": cand_last,
+                    "caption_summary": caption_summary,
+                    "caption_overlap": caption_overlap,
+                    "caption_duplicates": caption_dupes,
                 }
                 if best is None or cand["repair_score"] > best["repair_score"]:
                     best = cand
@@ -321,6 +383,9 @@ def main() -> None:
             "repair_seed": best["seed"],
             "repair_attempt_index": best["attempt_index"],
             "repair_candidate_index": best["candidate_index"],
+            "caption_summary": best.get("caption_summary"),
+            "caption_overlap": best.get("caption_overlap"),
+            "caption_duplicates": best.get("caption_duplicates"),
         }
         if args.replace_original:
             original = clips_dir / f"window_{idx:03d}.mp4"

@@ -13,4 +13,3 @@ def test_caption_stub_produces_anchor():
     assert len(captions) == 3
     assert isinstance(summary, str) and len(summary) > 0
     assert dupes is False
-

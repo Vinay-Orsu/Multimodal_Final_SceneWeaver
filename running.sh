@@ -1,25 +1,31 @@
 #!/usr/bin/env bash
 set -euo pipefail
-DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-cd "${DIR}"
+
+echo "=== Starting sceneweaver_full job ==="
+echo "Running on node: $(hostname)"
+echo "Job ID: ${SLURM_JOB_ID}"
+echo "Submit directory: ${SLURM_SUBMIT_DIR}"
+echo "Start time: $(date)"
+echo "--------------------------------------"
+
+# Always run from the directory where the job was submitted
+cd "${SLURM_SUBMIT_DIR}"
+
+# Create log folder if needed
 mkdir -p slurm_logs
 
-# Defaults aligned to current idle availability from sinfo; override when needed.
-SLURM_PARTITION="${SLURM_PARTITION:-a40}"
-SLURM_GRES="${SLURM_GRES:-gpu:a40:1}"
-SLURM_NODELIST="${SLURM_NODELIST:-}"
+# (Optional) Activate conda / venv if you use one
+# source ~/.bashrc
+# conda activate your_env_name
 
-SBATCH_ARGS=(
-  --partition="${SLURM_PARTITION}"
-  --gres="${SLURM_GRES}"
-  --export=ALL
-)
+# Print GPU info
+echo "=== GPU Info ==="
+nvidia-smi
+echo "--------------------------------------"
 
-if [ -n "${SLURM_NODELIST}" ]; then
-  SBATCH_ARGS+=(--nodelist="${SLURM_NODELIST}")
-fi
+# Run your actual pipeline
+# Replace this with your real entry point
+python your_main_script.py "$@"
 
-exec sbatch \
-  "${SBATCH_ARGS[@]}" \
-  "${DIR}/run_story_pipeline.sh" \
-  "$@"
+echo "--------------------------------------"
+echo "Job finished at: $(date)"
